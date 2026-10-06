@@ -1,6 +1,8 @@
 # RatRoll — plan
 
 ## Status (2026-10-06)
+- **Released**: v0.1.0 on GitHub (MrNog/RatRoll), page on Okanor's Forge. Every push to main
+  releases (same keywords as Okanvil) and posts to the Forge Discord (`LOG_WEBHOOK_FORGE`).
 - Done: steps 1–4. `python build.py` writes `RatRoll/` (the folder players install);
   hand-written parts are in `src/` (Guard, Boot, .toc). Installed on the HD client.
 - Art done: PNGs in `art/`, `python tools/make_art.py` (Pillow 11.2+) makes `src/Media/icon.blp`,
