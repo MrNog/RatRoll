@@ -1,0 +1,977 @@
+if RATROLL_OFF then return end -- generated from Okanvil/Core/Core.lua, edit there.  ============================================================
+--   ██████╗ ██╗  ██╗ █████╗ ███╗   ██╗██╗   ██╗██╗██╗
+--  ██╔═══██╗██║ ██╔╝██╔══██╗████╗  ██║██║   ██║██║██║
+--  ██║   ██║█████╔╝ ███████║██╔██╗ ██║██║   ██║██║██║
+--  ██║   ██║██╔═██╗ ██╔══██║██║╚██╗██║╚██╗ ██╔╝██║██║
+--  ╚██████╔╝██║  ██╗██║  ██║██║ ╚████║ ╚████╔╝ ██║███████╗
+--   ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═══╝  ╚═══╝  ╚═╝╚══════╝
+--  RatRoll -- a single raid & guild toolkit (MRT-style), by Okanor. One addon
+--  with a native core (guild dashboard + module manager) and a set of built-in
+--  modules (Guild / Invite / Recruit / Loot / ID Finder / Combat Logs) you toggle
+--  on/off per character. Modules register into RatRoll_Plugins and share one media
+--  layer. No standalone plugins -- it's all one addon.
+-- ============================================================
+
+RatRoll = RatRoll or {}
+local RatRoll = RatRoll
+
+-- ------------------------------------------------------------
+-- 3.3.5a API compat shim: SetShown was added in WoW 4.x (Cataclysm). On a stock
+-- 3.3.5a client the widget methods don't exist, so every `frame:SetShown(cond)`
+-- throws "attempt to call method 'SetShown' (a nil value)". Some custom/patched
+-- 3.3.5a cores backport it, which is why it works for some players and not
+-- others. Polyfill it onto the shared widget metatables here, BEFORE any UI is
+-- built (Core loads first in the .toc), so all 25+ call sites just work. Guarded
+-- so a client that already has SetShown (patched core) is left untouched.
+-- ------------------------------------------------------------
+do
+	local function polyfill(obj)
+		if not obj then return end
+		local mt = getmetatable(obj)
+		local idx = mt and mt.__index
+		if type(idx) ~= "table" then return end
+		if not idx.SetShown then
+			idx.SetShown = function(self, shown)
+				if shown then self:Show() else self:Hide() end
+			end
+		end
+	end
+	-- Each widget TYPE has its own method table on 3.3.5a -- a Frame, a Slider and a
+	-- Button do not share one. Every type we actually use must be patched, or
+	-- `slider:SetShown(...)` still dies with "attempt to call method 'SetShown'".
+	--
+	-- CRITICAL: do NOT create an EditBox here to "also patch it". A fresh EditBox
+	-- defaults to autoFocus=true and GRABS the keyboard on creation -- an orphan box
+	-- left focused eats W/A/S/D for the whole session and makes the game unplayable.
+	local f = CreateFrame("Frame")
+	polyfill(f)
+	polyfill(f:CreateTexture())
+	polyfill(f:CreateFontString())
+	polyfill(CreateFrame("Button"))
+	polyfill(CreateFrame("Slider"))
+	polyfill(CreateFrame("StatusBar"))
+	polyfill(CreateFrame("ScrollFrame"))
+	polyfill(CreateFrame("CheckButton"))
+	polyfill(CreateFrame("Cooldown"))
+end
+
+local LSM = LibStub and LibStub("LibSharedMedia-3.0", true)
+RatRoll.LSM = LSM
+
+RatRoll.version = GetAddOnMetadata and GetAddOnMetadata("RatRoll", "Version") or "1.0"
+RatRoll.entries = {}          -- name -> plugin table (registered)
+-- The addon's icon, in one place: title bar, minimap button, collapsed puck,
+-- marks bar, setup, Mini Roll, Settings badge. The game's own anvil.
+RatRoll.BRAND_ICON = "Interface\\Icons\\Trade_BlackSmithing"
+RatRoll._fontStrings = {}     -- font strings to restyle when the font changes
+
+-- ------------------------------------------------------------
+-- KEYBOARD-FOCUS SAFETY
+-- An EditBox with keyboard focus swallows ALL keys -- including W/A/S/D -- so a
+-- focus we forget to release makes the game unplayable (the user lost all keybinds
+-- and had to delete the addon). Rules, per the user:
+--   * NEVER auto-SetFocus (opening the addon must not steal the keyboard -- you
+--     could be mid-fight and unable to move).
+--   * Clicking ANYWHERE outside a text box drops focus.
+--   * Entering combat / closing the window / switching page releases focus.
+-- We track every EditBox we make and clear them all on those events.
+-- ------------------------------------------------------------
+RatRoll._editBoxes = RatRoll._editBoxes or {}
+function RatRoll:TrackEditBox(e)
+	if not e then return end
+	self._editBoxes[e] = true
+end
+function RatRoll:ClearAllFocus()
+	for e in pairs(self._editBoxes) do
+		if e.HasFocus and e:HasFocus() then e:ClearFocus() end
+	end
+end
+
+local FLAT = "Interface\\ChatFrame\\ChatFrameBackground"
+
+-- ------------------------------------------------------------
+-- ITEM CACHE WARMER  (shared by Mini Roll / Loot / Raid Finder)
+-- On a fresh client, GetItemInfo returns nil for an item it has never seen, so
+-- icons show "?" and AtlasLoot draws a red border. The fix is exactly what
+-- AtlasLoot's "Query" button does: a hidden GameTooltip:SetHyperlink forces the
+-- client to request the item from the server; a moment later GetItemInfo works.
+--   * RatRoll:WarmItem(link|id)  -> queue a server request (deduped, throttled)
+--   * RatRoll:ItemIcon(link|id)  -> icon texture now, or nil + auto-warm for later
+-- Warming is throttled to a few items/sec on a ticker so it can't lag/disconnect
+-- you (AtlasLoot's busy-loop can; ours is async).
+-- ------------------------------------------------------------
+do
+	local tip                       -- hidden scanning tooltip (created on demand)
+	local queue, queued = {}, {}    -- pending item keys + dedupe set
+	local ticker                    -- OnUpdate driver (runs only while queue nonempty)
+	local acc = 0
+
+	local function keyOf(itemLinkOrId)
+		if type(itemLinkOrId) == "number" then return "item:" .. itemLinkOrId end
+		if type(itemLinkOrId) ~= "string" then return nil end
+		if itemLinkOrId:find("item:") then
+			-- extract the numeric id so links/ids dedupe to the same key
+			local id = itemLinkOrId:match("item:(%d+)")
+			return id and ("item:" .. id) or itemLinkOrId
+		end
+		local id = tonumber(itemLinkOrId)
+		return id and ("item:" .. id) or nil
+	end
+
+	local function pump()
+		if #queue == 0 then
+			if ticker then ticker:SetScript("OnUpdate", nil); ticker:Hide() end
+			return
+		end
+		if not tip then
+			tip = CreateFrame("GameTooltip", "RatRollWarmTip", nil, "GameTooltipTemplate")
+			tip:SetOwner(WorldFrame, "ANCHOR_NONE")
+		end
+		-- process a few per tick (throttle -- server query is the risky part)
+		for _ = 1, 3 do
+			local key = table.remove(queue, 1)
+			if not key then break end
+			queued[key] = nil
+			GetItemInfo(key)                       -- triggers cache request
+			pcall(function() tip:SetHyperlink(key) end)
+		end
+	end
+
+	function RatRoll:WarmItem(itemLinkOrId)
+		local key = keyOf(itemLinkOrId)
+		if not key or queued[key] then return end
+		-- already cached? nothing to do.
+		if GetItemInfo(key) then return end
+		queued[key] = true
+		queue[#queue + 1] = key
+		if not ticker then
+			ticker = CreateFrame("Frame")
+		end
+		-- (re)arm the driver: it clears its own OnUpdate when the queue empties.
+		ticker:SetScript("OnUpdate", function(_, e)
+			acc = acc + e
+			if acc >= 0.1 then acc = 0; pump() end
+		end)
+		ticker:Show()
+	end
+
+	-- Return the icon texture NOW, or nil (and queue a warm so a later paint fills
+	-- it in). Order: (1) the ID Finder's FILE-persisted icon (survives a client
+	-- change -> no "?" after switching clients, IF you ran a Full scan), then
+	-- (2) the live client cache (select(10, GetItemInfo) = icon path in 3.3.5a).
+	function RatRoll:ItemIcon(itemLinkOrId)
+		if not itemLinkOrId then return nil end
+		-- try the saved DB first (needs a numeric id)
+		if RatRoll.IDs and RatRoll.IDs.ItemIcon then
+			local id = (type(itemLinkOrId) == "number") and itemLinkOrId
+				or tonumber(tostring(itemLinkOrId):match("item:(%d+)"))
+				or tonumber(itemLinkOrId)
+			if id then
+				local saved = RatRoll.IDs.ItemIcon(id)
+				if saved then return saved end
+			end
+		end
+		local tex = select(10, GetItemInfo(itemLinkOrId))
+		if not tex then self:WarmItem(itemLinkOrId) end
+		return tex
+	end
+end
+
+-- ------------------------------------------------------------
+-- Saved-variable defaults
+-- ------------------------------------------------------------
+local defaults = {
+	window = { width = 660, height = 480, point = "CENTER", x = 0, y = 0 },
+	scale = 1.0,
+	font = "Friz Quadrata TT", -- LSM font name
+	fontSize = 12,
+	textScale = 1.0,       -- Settings > Text size: page text only, button labels stay fixed
+	fontFlag = "", -- "", "OUTLINE", "THICKOUTLINE"
+	statusbar = "Blizzard", -- LSM statusbar (for plugins that draw bars)
+	bgAlpha = 0.95,
+	minimapAngle = 200,
+	modules = {},      -- name -> { enabled = bool }. Absent = enabled by default.
+	-- GUILD SKIN and web hub: EMPTY by default. RatRoll is not one guild's addon,
+	-- and shipping RATS in the defaults meant a fresh install -- or a character
+	-- in no guild at all -- advertised a guild it had nothing to do with.
+	-- Both are set in Settings > Branding, or with /ratroll brand|hub.
+	brand = "",
+	hubURL = "",
+	-- min item rarity to log, per instance type: 0 poor,1 common,2 uncommon,3 rare,4 epic
+	lootThresholdDungeon = 3, -- blue dungeon gear
+	lootThresholdRaid = 4,    -- epic only; orbs/Primordial Saronite/fragments bypass it
+	lootKeepDungeon = false,  -- a dungeon run shows in the mini roll, then is dropped
+	lootKeepRaid = true,
+	recordDungeon = true, -- capture attendance/loot in 5-man dungeons (party instances)
+	recordRaid = true,    -- capture attendance/loot in raids
+	closeOnPull = true,    -- DBM pull -> close all RatRoll windows (get out of the way on engage)
+	ratArt = "on",         -- forge wallpaper behind the whole window: "on" | "off"
+	ratAlpha = 0.45,       -- wallpaper strength (own slider; independent of bgAlpha)
+	devMode = false,       -- dev output -> dedicated "RatRoll" chat tab (off for raiders)
+}
+
+local function applyDefaults(dst, src)
+	for k, v in pairs(src) do
+		if dst[k] == nil then
+			if type(v) == "table" then
+				dst[k] = {}
+				applyDefaults(dst[k], v)
+			else
+				dst[k] = v
+			end
+		elseif type(v) == "table" then
+			applyDefaults(dst[k], v)
+		end
+	end
+end
+
+-- ------------------------------------------------------------
+-- Media (shared look -- plugins use these so everything matches)
+-- ------------------------------------------------------------
+-- The size here is the body size, and the fallback for a font string created
+-- without one -- the type scale (RatRoll.W.F) is what every call site names.
+-- Two size controls: the window's Scale zooms everything together; Text size
+-- (db.textScale) grows page text only. Button labels opt out (_okFixed), so a
+-- label can never outgrow the box it sits in.
+function RatRoll:TextScale()
+	local v = self.db and tonumber(self.db.textScale) or 1
+	return math.max(0.8, math.min(1.5, v))
+end
+function RatRoll:Font()
+	local db = self.db
+	local path = LSM and LSM:Fetch("font", db.font, true)
+	local base = (RatRoll.W and RatRoll.W.F and RatRoll.W.F.body) or db.fontSize or 12
+	local size = math.floor(base * self:TextScale() + 0.5)
+	return path or STANDARD_TEXT_FONT, size, db.fontFlag
+end
+
+function RatRoll:Texture()
+	return (LSM and LSM:Fetch("statusbar", self.db.statusbar, true)) or FLAT
+end
+
+-- create a font string that auto-restyles when the user changes the font
+function RatRoll:NewText(parent, layer, template)
+	local fs = parent:CreateFontString(nil, layer or "OVERLAY", template)
+	fs:SetFont(self:Font())
+	self._fontStrings[fs] = true
+	return fs
+end
+
+function RatRoll:ApplyFonts()
+	local font, size, flag = self:Font()
+	for fs in pairs(self._fontStrings) do
+		if fs.SetFont then
+			-- _okSize is the unscaled role size; Text size applies on top, except to
+			-- button labels (_okFixed)
+			local sz = size
+			if fs._okSize then
+				sz = fs._okFixed and fs._okSize or math.floor(fs._okSize * self:TextScale() + 0.5)
+			end
+			fs:SetFont(font, sz, flag)
+		end
+	end
+end
+
+-- flat 1px-bordered panel (the RatRoll/ElvUI look). Plugins: use RatRoll:Backdrop(frame).
+-- Kept for back-compat; delegates to the shared RatRoll:Skin (Widgets.lua) so
+-- legacy plugins pick up the same palette and alpha re-tinting as the shell.
+function RatRoll:Backdrop(frame, alpha, dark)
+	if self.Skin then
+		self:Skin(frame, dark and "dark" or "panel")
+		if alpha then
+			local r, g, b = frame:GetBackdropColor()
+			frame:SetBackdropColor(r, g, b, alpha)
+		end
+		return
+	end
+	-- fallback if Widgets.lua somehow didn't load
+	frame:SetBackdrop({
+		bgFile = FLAT, edgeFile = FLAT, edgeSize = 1,
+		insets = { left = 1, right = 1, top = 1, bottom = 1 },
+	})
+	local a = alpha or self.db.bgAlpha
+	if dark then frame:SetBackdropColor(0.06, 0.06, 0.08, a)
+	else frame:SetBackdropColor(0.10, 0.10, 0.12, a) end
+	frame:SetBackdropBorderColor(0.32, 0.32, 0.38, 1)
+end
+
+-- Every addon message goes to the "RatRoll" chat tab when that tab EXISTS, else to
+-- the default frame. We never create it here (DevFrame(false)): a raider who has
+-- never opened the tab keeps seeing messages in General instead of having a window
+-- appear unasked. Create it with /ratroll tab.
+--
+-- self:DevFrame is resolved at call time, so it being defined further down is fine.
+function RatRoll:Print(msg)
+	local f = (self.DevFrame and self:DevFrame(false)) or DEFAULT_CHAT_FRAME
+	f:AddMessage("|cffffd200[RatRoll]|r " .. tostring(msg))
+end
+
+-- ------------------------------------------------------------
+-- Walk the FULL guild roster without leaving the Blizzard guild UI changed.
+--
+-- 3.3.5a trap: GetNumGuildMembers() only counts ONLINE members unless "Show Offline"
+-- is on, so to iterate everyone you must SetGuildRosterShowOffline(true). But that
+-- flag is GLOBAL and STICKY -- it flips the checkbox in Blizzard's own Guild panel and
+-- stays on after we're done, which is why the guild tab was suddenly always showing
+-- offline members.
+--
+-- 3.3.5a has no reliable getter for the flag, and inferring "did we turn it on?" from
+-- the member count is unsound: forcing offline in does NOT change the count when the
+-- whole guild is already online, so we could never tell we'd enabled it and would leak
+-- it on. So we don't guess -- we ALWAYS restore the WoW default (offline hidden) after
+-- walking. Cost: a user who manually ticked "Show Offline" gets it unticked after we
+-- run. That is rare and far less bad than the addon silently forcing it on for everyone;
+-- if it ever matters, add an explicit opt-out setting.
+--
+--   RatRoll:WithFullRoster(function(total) ... GetGuildRosterInfo(i) ... end)
+--
+-- LOOP GUARD: toggling SetGuildRosterShowOffline fires GUILD_ROSTER_UPDATE. Our guild
+-- panel refreshes on that event, and the refresh calls WithFullRoster, which toggles
+-- again -> event -> refresh -> ... an endless storm that ends in a C stack overflow.
+-- The event is async (fires AFTER we return), so a simple in-function reentrancy flag
+-- is not enough. Instead we publish RatRoll.rosterBusy while we hold the flag; the
+-- GUILD_ROSTER_UPDATE handler skips its refresh when it sees a roster event we caused
+-- ourselves. Reads only ever set the flag briefly, so a real login/logoff that lands
+-- outside our window still refreshes normally.
+function RatRoll:WithFullRoster(fn)
+	if not (IsInGuild and IsInGuild()) then return end
+	if self.rosterBusy then
+		-- nested call (offline already forced in): run against the roster as-is
+		local total = (GetNumGuildMembers and GetNumGuildMembers()) or 0
+		local ok, err = pcall(fn, total)
+		if not ok and RatRoll.Err then RatRoll:Err("WithFullRoster(nested)", err) end
+		return
+	end
+	self.rosterBusy = true
+	if SetGuildRosterShowOffline then SetGuildRosterShowOffline(true) end
+	local total = (GetNumGuildMembers and GetNumGuildMembers()) or 0
+	local ok, err = pcall(fn, total)
+	if SetGuildRosterShowOffline then SetGuildRosterShowOffline(false) end
+	-- Keep the guard up briefly: GUILD_ROSTER_UPDATE from our two toggles arrives
+	-- AFTER we return here (it's async), so clearing rosterBusy now would let that
+	-- late event trigger a refresh -> another WithFullRoster -> the loop. Drop it a
+	-- moment later; a genuine login/logoff event after that still refreshes.
+	if RatRoll.Comms and RatRoll.Comms.After then
+		RatRoll.Comms.After(0.3, function() RatRoll.rosterBusy = false end)
+	else
+		self.rosterBusy = false
+	end
+	if not ok and RatRoll.Err then RatRoll:Err("WithFullRoster", err) end
+end
+
+-- ------------------------------------------------------------
+-- DEV CHAT TAB -- a dedicated "RatRoll" chat window (like DBM's debug tab),
+-- sitting next to General / Combat Log. Debug output goes there instead of
+-- spamming the general chat. Created ON DEMAND (only when dev mode is turned
+-- on), so raiders never see it.
+--
+-- 3.3.5a API: FCF_OpenNewWindow(name) opens a new chat window and returns it in
+-- the global ChatFrameN; GetChatWindowInfo(i) gives each window's name. There is
+-- no C_ChatInfo here -- windows are plain frames we can AddMessage() to.
+-- ------------------------------------------------------------
+local DEV_TAB_NAME = "RatRoll"
+local devFrame                       -- cached ChatFrame we write into
+
+-- find an existing chat window called "RatRoll" (survives /reload -- the client
+-- persists chat windows, so we must re-find it rather than open a duplicate).
+local function findDevFrame()
+	for i = 1, (NUM_CHAT_WINDOWS or 10) do
+		local name = GetChatWindowInfo and GetChatWindowInfo(i)
+		if name == DEV_TAB_NAME then return _G["ChatFrame" .. i] end
+	end
+	return nil
+end
+
+-- Get the dev chat frame, creating the tab if asked to (and if we can).
+function RatRoll:DevFrame(createIfMissing)
+	if devFrame and devFrame.AddMessage then return devFrame end
+	devFrame = findDevFrame()
+	if devFrame or not createIfMissing then return devFrame end
+	if not FCF_OpenNewWindow then return nil end
+	-- opening a window can fail when all 10 slots are used
+	local ok = pcall(FCF_OpenNewWindow, DEV_TAB_NAME)
+	if ok then devFrame = findDevFrame() end
+	return devFrame
+end
+
+-- Write one line to the dev tab. Falls back to the default chat frame only when
+-- the tab could not be created, so a message is never silently lost.
+function RatRoll:Dev(msg)
+	if not self.db or not self.db.devMode then return end
+	local f = self:DevFrame(true) or DEFAULT_CHAT_FRAME
+	f:AddMessage("|cff8a8d93[dbg]|r " .. tostring(msg))
+end
+
+-- ------------------------------------------------------------
+-- SILENT-ERROR REPORTER. Wrap a pcall's failure with this instead of dropping
+-- it: `if not ok then RatRoll:Err("Comms.After", err) end`.
+--
+-- Rules that keep it from ever becoming spam:
+--   * dev mode OFF -> PRINTS nothing anywhere (raiders never see it),
+--   * ...but it is still RECORDED, so a bug that happened mid-raid is waiting
+--     for you afterwards even though you never had dev mode on,
+--   * the same error at the same site prints ONCE per session; repeats only
+--     bump a counter (an error inside OnUpdate would otherwise print 60x/sec).
+--
+-- The record lives in the per-character DB, which WoW flushes to
+-- SavedVariables\RatRoll.lua on logout/reload -- so nothing is lost if you
+-- forget to check it before quitting. Read it back with
+-- `/rrerr`, or straight out of the .lua file.
+-- ------------------------------------------------------------
+-- A WoW addon cannot write files (no `io` in the sandbox). The ONLY file we get
+-- is a SavedVariable, which the client flushes on logout/reload. `RatRollBugDB`
+-- is declared in the .toc purely for this, so the crash history sits in its own
+-- top-level table inside:
+--     WTF\Account\<ACCOUNT>\SavedVariables\RatRoll.lua
+-- A raider who hit a bug sends that file; you read the RatRollBugDB block and
+-- ignore the rest. (BugSack persists its errors the same way.)
+--
+-- Layout: RatRollBugDB.sessions = { {start=<unix>, ver=<addon ver>, errors={...}}, ... }
+-- newest session LAST. Each error: { context, msg, count, first, last }.
+local ERR_SESSIONS = 5    -- keep the last N play sessions
+local ERR_PER_SESS  = 40  -- distinct errors per session (bounds the SV file)
+
+local errSession          -- the session table for THIS login (created lazily)
+
+function RatRoll:ErrorLog()
+	-- The SV table only exists after ADDON_LOADED; an error can fire earlier, so
+	-- create it on demand rather than erroring inside the error reporter itself.
+	RatRollBugDB = RatRollBugDB or {}
+	RatRollBugDB.sessions = RatRollBugDB.sessions or {}
+	return RatRollBugDB.sessions
+end
+
+-- The session record for this login, trimming old sessions on first use.
+local function currentErrSession(self)
+	if errSession then return errSession end
+	local log = self:ErrorLog()
+	errSession = {
+		start = time(), ver = self.version or "?",
+		char = (UnitName and UnitName("player")) or "?",
+		errors = {},
+	}
+	log[#log + 1] = errSession
+	while #log > ERR_SESSIONS do table.remove(log, 1) end
+	return errSession
+end
+
+-- Record a silent error. ALWAYS persisted (so you can ask a raider for their
+-- RatRoll.lua after a bug), but only PRINTED when dev mode is on -- and then
+-- only once per distinct error, so a failure inside OnUpdate can't spam.
+function RatRoll:Err(context, err)
+	local ctx, msg = tostring(context or "?"), tostring(err or "?")
+	local s = currentErrSession(self)
+	for _, e in ipairs(s.errors) do
+		if e.context == ctx and e.msg == msg then
+			e.count = (e.count or 1) + 1
+			e.last = time()
+			return                                -- already reported this session
+		end
+	end
+	if #s.errors >= ERR_PER_SESS then return end  -- full: drop rather than grow the SV
+	s.errors[#s.errors + 1] = { context = ctx, msg = msg, count = 1, first = time(), last = time() }
+	self:Dev("|cffff5555ERROR|r " .. ctx .. ": " .. msg)
+end
+
+-- ------------------------------------------------------------
+-- TRACE: an always-on record of what the addon did, written beside the errors
+-- of the same login (RatRollBugDB.sessions[n].trace), the way the combat log is
+-- written whether or not anyone reads it. Nothing to switch on: after a bad
+-- night the answer is already in SavedVariables\RatRoll.lua.
+--
+-- One line per event, oldest first:
+--     "21:14:03.271 COMMS -> RAID LOOT 96b/64b <text>"   (-> sent, <- received)
+-- The seconds carry the fraction of GetTime(), so events in the same second keep
+-- their order. A long login keeps its newest TRACE_PER_SESS lines; the count of
+-- lines dropped from the front is kept in traceDropped.
+-- ------------------------------------------------------------
+local TRACE_PER_SESS = 4000
+local TRACE_TRIM     = 500    -- lines removed at once when full, so trimming is rare
+
+function RatRoll:Trace(cat, text)
+	local s = currentErrSession(self)
+	local t = s.trace
+	if not t then t = {}; s.trace = t end
+	if #t >= TRACE_PER_SESS then
+		local keep = {}
+		for i = TRACE_TRIM + 1, #t do keep[#keep + 1] = t[i] end
+		s.trace, t = keep, keep
+		s.traceDropped = (s.traceDropped or 0) + TRACE_TRIM
+	end
+	local ms = math.floor(((GetTime and GetTime()) or 0) % 1 * 1000)
+	t[#t + 1] = ("%s.%03d %s %s"):format(date("%H:%M:%S"), ms, tostring(cat or "?"), tostring(text or ""))
+end
+
+-- This session's distinct errors, most frequent first.
+function RatRoll:ErrorSummary()
+	local out = {}
+	for _, e in ipairs(currentErrSession(self).errors) do out[#out + 1] = e end
+	table.sort(out, function(a, b) return (a.count or 0) > (b.count or 0) end)
+	return out
+end
+
+-- Whole history, formatted for the copy box (/rrerr). This is also what
+-- you read straight out of RatRoll.lua when a raider sends you their file.
+function RatRoll:ErrorReport()
+	local log = self:ErrorLog()
+	local total = 0
+	for _, s in ipairs(log) do total = total + #s.errors end
+	if total == 0 then return nil end
+	local out = { "RatRoll error log -- " .. #log .. " session" .. (#log ~= 1 and "s" or "")
+		.. ", " .. total .. " error" .. (total ~= 1 and "s" or "") }
+	for i = #log, 1, -1 do                        -- newest session first
+		local s = log[i]
+		out[#out + 1] = ""
+		out[#out + 1] = "=== " .. date("%Y-%m-%d %H:%M", s.start or 0)
+			.. "   " .. (s.char or "?") .. "   RatRoll v" .. (s.ver or "?")
+			.. "   (" .. #s.errors .. " error" .. (#s.errors ~= 1 and "s" or "") .. ")"
+		if #s.errors == 0 then out[#out + 1] = "    (none)" end
+		for _, e in ipairs(s.errors) do
+			out[#out + 1] = "  [x" .. (e.count or 1) .. "] " .. date("%H:%M", e.first or 0)
+				.. "  " .. (e.context or "?") .. ": " .. (e.msg or "?")
+		end
+	end
+	return table.concat(out, "\n")
+end
+
+function RatRoll:ClearErrors()
+	RatRollBugDB = { sessions = {} }
+	errSession = nil
+end
+
+-- Turn dev mode on/off. Opening the tab is deferred to the first Dev() call, but
+-- we create it here too so the user immediately SEES where output will land.
+function RatRoll:SetDevMode(on)
+	self.db.devMode = on and true or false
+	if self.db.devMode then
+		local f = self:DevFrame(true)
+		self:Print("Dev mode |cff7cfc8aON|r"
+			.. (f and (" -- output goes to the |cffe0b860" .. DEV_TAB_NAME .. "|r chat tab.")
+			or " -- |cffff5555could not open a chat tab (all 10 in use); using default chat.|r"))
+	else
+		self:Print("Dev mode |cff8a8d93OFF|r")
+	end
+end
+
+-- Should we record attendance/loot right now? Respects the dungeon/raid toggles.
+-- Outside instances (e.g. world) we still allow it (manual snapshots, etc.).
+function RatRoll:ShouldRecord()
+	if not GetInstanceInfo then return true end
+	local _, instanceType = GetInstanceInfo()
+	if instanceType == "party" then return self.db.recordDungeon ~= false end
+	if instanceType == "raid" then return self.db.recordRaid ~= false end
+	return true
+end
+
+-- ------------------------------------------------------------
+-- Plugin registry (load-order safe: plugins fill RatRoll_Plugins)
+-- ------------------------------------------------------------
+function RatRoll:Register(name)
+	local p = RatRoll_Plugins and RatRoll_Plugins[name]
+	if not p or self.entries[name] then
+		return
+	end
+	self.entries[name] = p
+	if self.RefreshNav then
+		self:RefreshNav() -- live update if the window is already built
+	end
+end
+
+function RatRoll:ProcessPlugins()
+	if not RatRoll_Plugins then
+		return
+	end
+	for name in pairs(RatRoll_Plugins) do
+		self:Register(name)
+	end
+end
+
+function RatRoll:CountPlugins()
+	local n = 0
+	for _ in pairs(self.entries) do
+		n = n + 1
+	end
+	return n
+end
+
+-- ------------------------------------------------------------
+-- Module enable state -- PER CHARACTER (RatRoll_CharDB). Default: enabled. Each
+-- toon decides which tools show; content settings stay account-wide. A disabled
+-- module is still registered but hidden from the nav; deeper event-gating is
+-- opt-in inside each module later.
+-- ------------------------------------------------------------
+function RatRoll:IsModuleEnabled(name)
+	-- __guild used to be forced on here, which made it impossible to switch off
+	-- even though the Modules list had a row for it. It drives the roster JSON
+	-- export and the automatic attendance capture -- both of which only matter to
+	-- a guild running a web hub -- so a guild without one, or a character in no
+	-- guild at all, must be able to turn it off.
+	-- Invite has no switch any more (see NATIVE). A character that turned it off
+	-- back when it had one would otherwise stay off with no way to turn it on --
+	-- and the snapshot Invite buttons would say the module is off.
+	if name == "__invite" then return true end
+	local m = self.cdb and self.cdb.modules and self.cdb.modules[name]
+	if m and m.enabled == false then
+		return false
+	end
+	return true
+end
+
+-- Should this module's PASSIVE behaviour run right now? A DISABLED module must be
+-- as if it didn't exist -- it must NOT scan chat, log combat, capture loot, or
+-- auto-invite. Every module gates its event handlers / OnUpdate ticks with this
+-- (return early when false). Safe before login (cdb nil -> treated as enabled, so
+-- boot events still register). This is the ONE rule for "off = off, not just hidden".
+function RatRoll:ModuleActive(name)
+	if not self.cdb then return true end   -- pre-login: let boot run
+	return self:IsModuleEnabled(name)
+end
+
+-- ------------------------------------------------------------
+-- QUIET IN COMBAT. During a fight RatRoll runs only what the fight needs (notes,
+-- combat logging, boss detection, the loot council). Background bookkeeping --
+-- roster walks, sync announces, page refreshes -- waits for combat to end. What
+-- the user switched on by hand (Recruit / PuG advertising) is never held back. A raid fires
+-- roster events in bursts, and each one used to walk the whole guild roster in
+-- several modules at once: that is frames lost mid-pull, only in raids.
+--
+--   RatRoll:InCombat()            -> true while in combat
+--   RatRoll:CombatSafe(key, fn)   -> a wrapper for an event handler: runs fn now
+--                                    out of combat; in combat it queues ONE call
+--                                    under `key` (the last args win) and runs it
+--                                    when combat ends. Twenty roster events in a
+--                                    pull become one run afterwards.
+-- ------------------------------------------------------------
+function RatRoll:InCombat()
+	return InCombatLockdown() and true or false
+end
+
+-- Inside a raid instance, passive background work (Raid Finder reading chat for
+-- other groups' LFMs) stays off the whole time, not just per pull: between pulls
+-- is when the council runs, and trash pulls overlap it.
+function RatRoll:InRaidInstance()
+	local inside, kind = IsInInstance()
+	return (inside and kind == "raid") and true or false
+end
+
+local afterCombat, afterOrder = {}, {}
+function RatRoll:CombatSafe(key, fn)
+	return function(...)
+		if not InCombatLockdown() then return fn(...) end
+		if not afterCombat[key] then afterOrder[#afterOrder + 1] = key end
+		afterCombat[key] = { fn = fn, n = select("#", ...), args = { ... } }
+	end
+end
+
+do
+	local f = CreateFrame("Frame")
+	f:RegisterEvent("PLAYER_REGEN_ENABLED")
+	f:SetScript("OnEvent", function()
+		local order = afterOrder
+		afterOrder = {}
+		for _, key in ipairs(order) do
+			local job = afterCombat[key]
+			afterCombat[key] = nil
+			if job then
+				local ok, err = pcall(job.fn, unpack(job.args, 1, job.n))
+				if not ok and RatRoll.Err then RatRoll:Err("CombatSafe " .. key, err) end
+			end
+		end
+	end)
+end
+
+-- Is this page on the Raid Check shortcut strip?
+--
+-- Separate from whether the module is ENABLED: a module can be on and still not
+-- earn a place on a strip you read mid-pull. Twelve icons is more than anyone
+-- wants there, and which twelve matters to one guild and not another.
+--
+-- Per character, beside the enable flag, and ABSENT MEANS ON so the strip looks
+-- the same on a fresh install as it did before there was a switch.
+function RatRoll:IsShortcutEnabled(name)
+	local cdb = self.cdb
+	if not cdb then return true end
+	local m = cdb.modules and cdb.modules[name]
+	if not m or m.shortcut == nil then return true end
+	return m.shortcut and true or false
+end
+
+function RatRoll:SetShortcutEnabled(name, on)
+	local cdb = self.cdb
+	if not cdb then return end
+	cdb.modules = cdb.modules or {}
+	cdb.modules[name] = cdb.modules[name] or {}
+	cdb.modules[name].shortcut = on and true or false
+	-- The marks bar is where the shortcuts live. It keeps its own buttons, so
+	-- it has to be told to draw them again.
+	if self.MarksBar and self.MarksBar.Refresh then self.MarksBar:Refresh() end
+end
+
+function RatRoll:SetModuleEnabled(name, enabled)
+	local cdb = self.cdb
+	cdb.modules = cdb.modules or {}
+	cdb.modules[name] = cdb.modules[name] or {}
+	cdb.modules[name].enabled = enabled and true or false
+	if self.RefreshNav then self:RefreshNav() end
+	-- The marks bar carries shortcuts INTO modules, so it has to repaint too --
+	-- it only re-read its gates on login and roster events, which left a button
+	-- for a module you had just switched off, still working.
+	if self.MarksBar and self.MarksBar.Refresh then self.MarksBar:Refresh() end
+	-- if the active panel was just disabled, fall back to Home
+	if not enabled and self._current == name and self.ShowPanel then
+		self:ShowPanel("__home")
+	end
+end
+
+-- ------------------------------------------------------------
+-- DBM pull -> close every RatRoll window, so the UI is out of the way the moment
+-- the raid engages. Toggleable via db.closeOnPull (default on).
+--
+-- This RETRIES. DBM on 3.3.5a is a multi-file addon that builds its callback API
+-- across its own load steps, so at our PLAYER_LOGIN `DBM.RegisterCallback` is
+-- frequently still nil -- a one-shot check there attaches nothing and, with a
+-- "already hooked" flag guarding it, never tries again. That is why the pull
+-- close silently did nothing on a client where DBM loads after us.
+-- ------------------------------------------------------------
+local DBM_HOOK_TRIES, DBM_HOOK_EVERY = 20, 1.5
+
+function RatRoll:HookDBMPull(attempt)
+	if self._dbmPullHooked then return end
+	attempt = attempt or 1
+
+	if DBM and DBM.RegisterCallback then
+		local ok = pcall(function()
+			DBM:RegisterCallback("DBM_Pull", function()
+				if RatRoll.db and RatRoll.db.closeOnPull == false then return end
+				if RatRoll.CloseAll then RatRoll:CloseAll() end
+			end)
+		end)
+		if ok then self._dbmPullHooked = true; return end
+	end
+
+	-- Not ready yet (or the register threw): come back and try again.
+	if attempt < DBM_HOOK_TRIES and self.Comms and self.Comms.After then
+		self.Comms.After(DBM_HOOK_EVERY, function()
+			RatRoll:HookDBMPull(attempt + 1)
+		end)
+	end
+end
+
+-- ------------------------------------------------------------
+-- Events / boot
+-- ------------------------------------------------------------
+local core = CreateFrame("Frame")
+core:RegisterEvent("ADDON_LOADED")
+core:RegisterEvent("PLAYER_LOGIN")
+core:RegisterEvent("PLAYER_REGEN_DISABLED")   -- entered combat -> release keyboard
+core:SetScript("OnEvent", function(_, event, arg1)
+	if event == "PLAYER_REGEN_DISABLED" then
+		-- combat started: never keep the keyboard captured (movement must work)
+		RatRoll:ClearAllFocus()
+		return
+	end
+	if event == "ADDON_LOADED" and arg1 == "RatRoll" then
+		-- No saved file at all = an install that has never run: the first-run
+		-- setup is owed. An existing user never gets the flag, so it never shows.
+		local fresh = (RatRoll_DB == nil)
+		RatRoll_DB = RatRoll_DB or {}
+		applyDefaults(RatRoll_DB, defaults)
+		if fresh then RatRoll_DB.setupPending = true end
+		-- The corner rat became a full-window wallpaper, which needs more strength
+		-- to read. Lift the old default once; a value the user picked is kept.
+		if not RatRoll_DB.wallpaperV1 then
+			if RatRoll_DB.ratAlpha == 0.30 then RatRoll_DB.ratAlpha = 0.45 end
+			RatRoll_DB.wallpaperV1 = true
+		end
+		RatRoll.db = RatRoll_DB
+		-- PER-CHARACTER state (which modules THIS toon shows). Content settings
+		-- (brand, fonts, recruit messages, item DB...) stay account-wide in db;
+		-- only enable/disable is per-char, so each toon can turn tools on/off.
+		RatRoll_CharDB = RatRoll_CharDB or {}
+		RatRoll.cdb = RatRoll_CharDB
+		-- one-time migration: move any account-wide module toggles to this char
+		if RatRoll_DB.modules and not RatRoll_CharDB.modules then
+			RatRoll_CharDB.modules = RatRoll_DB.modules
+			RatRoll_DB.modules = nil
+		end
+		RatRoll_CharDB.modules = RatRoll_CharDB.modules or {}
+		-- migrate old saved brands: the product name is now a FIXED wordmark, so
+		-- db.brand is only the guild skin. Strip a leading "RatRoll" (+ separator)
+		-- left over from when it held the whole "RatRoll - <guild>" string.
+		local b = RatRoll_DB.brand
+		if type(b) == "string" then
+			local skin = b:gsub("^%s*[Oo]kanvil%s*[%-%:%|\194\183]*%s*", "")
+			if skin == "RatRoll" then skin = "" end
+			RatRoll_DB.brand = skin
+		end
+	elseif event == "PLAYER_LOGIN" then
+		RatRoll:ProcessPlugins()
+		if RatRoll.BuildMinimap then
+			RatRoll:BuildMinimap()
+		end
+		RatRoll:HookDBMPull()
+
+		-- WARM THE GUILD ROSTER.
+		--
+		-- GetNumGuildMembers() answers 0 until the client has actually fetched the
+		-- roster from the server, and nothing asked for it until you opened Home --
+		-- so the first open rendered an empty/short list and only filled in a beat
+		-- later, which reads as "the addon takes a while to show up".
+		--
+		-- Asking here means the answer is already cached by the time the window is
+		-- opened. Requested twice: the very first GuildRoster() right after login can
+		-- land before the server is ready to answer it.
+		if IsInGuild and IsInGuild() and GuildRoster then
+			GuildRoster()
+			if RatRoll.Comms and RatRoll.Comms.After then
+				RatRoll.Comms.After(2, function()
+					if IsInGuild() and GuildRoster then GuildRoster() end
+				end)
+			end
+		end
+
+		if not RatRoll.LITE then
+			RatRoll:Print("loaded -- |cff00ff00/ratroll|r. " .. RatRoll:CountPlugins() .. " plugin(s).")
+		end
+
+		-- A few seconds in, so it lands after the login spam and the loading
+		-- screen rather than under them.
+		if RatRoll.db.setupPending and RatRoll.ShowSetup and RatRoll.Comms and RatRoll.Comms.After then
+			RatRoll.Comms.After(4, function()
+				if RatRoll.db.setupPending and not InCombatLockdown() then RatRoll:ShowSetup() end
+			end)
+		end
+	end
+end)
+
+-- ------------------------------------------------------------
+-- Slash
+-- ------------------------------------------------------------
+SLASH_RatRoll1 = "/ratroll"
+SlashCmdList["RatRoll"] = function(arg)
+	-- keep the original case for anything that takes a VALUE (a URL, a guild's
+	-- own spelling of its name); only the command word is matched lowercased
+	local raw = (arg or ""):gsub("^%s+", ""):gsub("%s+$", "")
+	arg = raw:lower()
+	if arg == "setup" then
+		if RatRoll.ShowSetup then
+			RatRoll:ShowSetup()
+		else
+			-- A file added to the .toc is only read when the client starts;
+			-- /reload re-runs the files it already knew about.
+			RatRoll:Print("|cffff5555Setup is not loaded.|r Exit WoW completely and start it"
+				.. " again -- /reload does not pick up new addon files.")
+		end
+		return
+	end
+	if arg == "tab" then
+		-- opt in to the dedicated chat tab: from now on Print() lands there
+		local f = RatRoll:DevFrame(true)
+		if f then
+			RatRoll:Print("RatRoll messages now go to the |cffe0b860RatRoll|r chat tab.")
+		else
+			RatRoll:Print("|cffff5555Could not open a chat tab (all 10 slots in use).|r")
+		end
+		return
+	end
+	-- Branding lives here rather than on the Settings page: a guild sets its skin
+	-- and hub link once, on the day it installs RatRoll, and then never again --
+	-- which is not worth a third of the page you open to change the window scale.
+	-- /ratroll generic -- strip every guild-specific setting in one go.
+	--
+	-- The defaults ship empty now, but SavedVariables is account-wide and already
+	-- written: a brand set months ago is still there on a brand-new character in
+	-- no guild. This is the "make this install not about my guild" button.
+	if arg:find("^generic") then
+		RatRoll.db.brand  = ""
+		RatRoll.db.hubURL = ""
+		if RatRoll.headerPaintBrand then RatRoll.headerPaintBrand() end
+		if RatRoll.footerPaintHub then RatRoll.footerPaintHub() end
+		RatRoll.panels["__home"] = nil
+		RatRoll:Print("Guild skin and web hub cleared. "
+			.. "|cff8a8d93Loot priority and notes are separate -- clear those on their own pages.|r")
+		return
+	end
+	local brand = arg:find("^brand") and raw:match("^%S+%s*(.*)$") or nil
+	if brand then
+		RatRoll.db.brand = (brand ~= "" and brand) or ""
+		if RatRoll.headerPaintBrand then RatRoll.headerPaintBrand() end
+		RatRoll.panels["__home"] = nil
+		RatRoll:Print(brand ~= "" and ("guild skin set to |cffe0b860" .. brand .. "|r")
+			or "guild skin cleared -- the title bar reads just \"RatRoll\".")
+		return
+	end
+	local hub = arg:find("^hub") and raw:match("^%S+%s*(.*)$") or nil
+	if hub then
+		RatRoll.db.hubURL = (hub ~= "" and hub) or ""
+		if RatRoll.footerPaintHub then RatRoll.footerPaintHub() end
+		RatRoll:Print(hub ~= "" and ("web hub set to |cffe0b860" .. hub .. "|r")
+			or "web hub cleared.")
+		return
+	end
+	if arg == "dev" then
+		local on = not (RatRoll.db.devMode and true or false)
+		RatRoll:SetDevMode(on)
+		RatRoll:Print(on and "dev mode |cff7cfc8aON|r -- debug goes to the |cffe0b860RatRoll|r chat tab."
+			or "dev mode |cff8a8d93OFF|r.")
+		return
+	end
+	if arg == "help" or arg == "?" then
+		RatRoll:Print("commands:")
+		RatRoll:Print("  |cffffd200/ratroll|r        open/close the window   |cff8a8d93(/ratroll tab = own chat tab)|r")
+		RatRoll:Print("  |cffffd200/ratroll brand <name>|r  your guild's skin  |cff8a8d93(empty = clear)|r")
+		RatRoll:Print("  |cffffd200/ratroll hub <url>|r     web hub link      |cff8a8d93(empty = clear)|r")
+		RatRoll:Print("  |cffffd200/ratroll dev|r          debug to the RatRoll chat tab")
+		RatRoll:Print("  |cffffd200/rr|r         mini roll manager")
+		RatRoll:Print("  |cffffd200/rrerr|r          error log  |cff8a8d93(clear)|r")
+		RatRoll:Print("  |cffffd200/rrfocus|r    release a stuck keyboard focus")
+			RatRoll:Print("  |cff8a8d93every module opens from the minimap button.|r")
+		return
+	end
+	RatRoll:Toggle()
+end
+
+-- Emergency keyboard release: if anything ever traps the keyboard again, this
+-- clears our tracked boxes AND force-releases any lingering focus. Type /rrfocus.
+SLASH_OKFOCUS1 = "/rrfocus"
+SlashCmdList["OKFOCUS"] = function()
+	RatRoll:ClearAllFocus()
+	RatRoll:Print("released keyboard focus.")
+end
+
+-- Dev mode is /ratroll dev (default OFF). It had a checkbox on a Settings page of
+-- its own, which is a screen for a switch only its author ever flips. Debug
+-- output goes to the "RatRoll" chat tab while it is on.
+
+-- /rrerr        -- show the persisted error log (copyable; survives logout)
+-- /rrerr clear  -- wipe it
+-- /rrver -- who in the group or guild is running RatRoll, and which build.
+-- Not council-specific: a version mismatch is the first thing to rule out for
+-- ANY "it works for me but not for him" report, and the window was previously
+-- reachable only by opening the Settings page and scrolling to find it.
+SLASH_OKVER1 = "/rrver"
+SlashCmdList["OKVER"] = function()
+	if RatRoll.ShowVersionChecker then RatRoll:ShowVersionChecker()
+	else RatRoll:Print("|cffff5555Version checker unavailable.|r") end
+end
+
+SLASH_OKERR1 = "/rrerr"
+SlashCmdList["OKERR"] = function(arg)
+	arg = (arg or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
+	if arg == "clear" then
+		RatRoll:ClearErrors()
+		RatRoll:Print("Error log cleared.")
+		return
+	end
+	local report = RatRoll:ErrorReport()
+	if not report then
+		RatRoll:Print("No errors recorded. |cff7cfc8aNice.|r")
+		return
+	end
+	if RatRoll.ShowExport then
+		RatRoll:ShowExport(report, "RatRoll errors -- Ctrl+C to copy")
+	else
+		RatRoll:Print(report)
+	end
+end
+

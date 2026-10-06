@@ -1,0 +1,11 @@
+## Interface: 30300
+## Title: RatRoll
+## Notes: The lucky roll -- mini roll, master loot and soft reserves. From Okanvil, by Okanor.
+## Author: Okanor
+## Version: 0.1.0
+## OptionalDeps: Okanvil
+## SavedVariables: RatRoll_DB, RatRollBugDB
+## SavedVariablesPerCharacter: RatRoll_CharDB
+Guard.lua
+{{FILES}}
+Boot.lua
