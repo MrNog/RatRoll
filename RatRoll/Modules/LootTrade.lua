@@ -311,8 +311,8 @@ end)
 
 -- /rrtrade        -- what you still owe, and to whom
 -- /rrtrade clear  -- forget all of it (the squares and tooltip lines go too)
-SLASH_OKTRADE1 = "/rrtrade"
-SlashCmdList["OKTRADE"] = function(msg)
+SLASH_RRTRADE1 = "/rrtrade"
+SlashCmdList["RRTRADE"] = function(msg)
 	local list = owed()
 	if (msg or ""):lower():match("^%s*clear") then
 		for i = #list, 1, -1 do table.remove(list, i) end

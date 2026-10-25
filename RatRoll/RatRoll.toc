@@ -24,6 +24,7 @@ Modules\SoftRes.lua
 Modules\Loot.lua
 Modules\LootSync.lua
 Modules\LootRoll.lua
+Modules\LootGive.lua
 Modules\SoftRes-UI.lua
 Modules\LootTrade.lua
 Modules\RaidLoot-Data.lua

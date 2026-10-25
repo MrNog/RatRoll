@@ -148,6 +148,10 @@ function SR.Clear()
 	local d = db()
 	d.items, d.names, d.at, d.from, d.nItems, d.nPlayers = nil, nil, nil, nil, nil, nil
 	d.bosses, d.order = nil, nil
+	-- every raider's own record of their reserves goes with the list
+	if SR.ForgetMyReserves then SR.ForgetMyReserves() end
+	local C = RatRoll.Comms
+	if C and C.Send then C.Send("SRCLEAR") end
 	if SR.onChange then SR.onChange() end
 	if SR.onPanel then SR.onPanel() end
 end
@@ -190,6 +194,8 @@ local function isLeadOrML(who)
 	end
 	return false
 end
+
+SR.IsLeadOrML = isLeadOrML
 
 function SR.CanShare()
 	if not SR.Summary() then return false end
@@ -283,12 +289,270 @@ local function idOf(item)
 	return nil
 end
 
+-- ---- Loot mode ------------------------------------------------------------
+-- How tonight's loot is shared out, picked by the master looter:
+--   "council"  loot council (and its priority list); soft reserves are ignored
+--   "sr"       soft reserves: a softres.it CSV, "sr [item]" whispers, or the
+--              pick window for raiders who run RatRoll; no council
+--   "roll"     plain MS / OS rolls; no soft reserves, no council -- the default
+-- A pick lasts while the group does and ends when it disbands (DISBAND_GRACE
+-- later); picked solo, it waits MODE_TTL for a group. Then it is Roll again, so
+-- last week's council night never comes back on its own. RatRoll (LITE) has no tiles
+-- and is all about soft reserves, so its default is SR.
+-- Hard reserves and reserved loot kinds (PuG page) apply in every mode.
+local MODES = { council = true, sr = true, roll = true }
+local MODE_TTL = 3 * 3600
+local DISBAND_GRACE = 120   -- seconds a pick outlives its group
+
+-- Who sets the mode for the group: the master looter, or with no master loot
+-- the group leader. Solo, you. Everyone else sees theirs, read-only.
+local function shortName(n) return n and (n:gsub("%-.*$", "")) or n end
+local function inGroup() return (GetNumRaidMembers() or 0) > 0 or (GetNumPartyMembers() or 0) > 0 end
+local function setterName()
+	local L = RatRoll.Loot
+	local ml = L and L.MasterLooterName and L.MasterLooterName()
+	if ml and ml ~= "" then return shortName(ml) end
+	if (GetNumRaidMembers() or 0) > 0 then
+		for i = 1, GetNumRaidMembers() do
+			local name, rank = GetRaidRosterInfo(i)
+			if rank == 2 then return shortName(name) end
+		end
+	elseif (GetNumPartyMembers() or 0) > 0 then
+		if UnitIsPartyLeader("player") then return UnitName("player") end
+		for i = 1, GetNumPartyMembers() do
+			if UnitIsPartyLeader("party" .. i) then return shortName(UnitName("party" .. i)) end
+		end
+	end
+	return nil
+end
+function SR.ModeSetter() return setterName() end
+function SR.CanSetMode()
+	if not inGroup() then return true end
+	local who = setterName()
+	return who == nil or who:lower() == (UnitName("player") or ""):lower()
+end
+
+local remote            -- { mode, from } as the setter sent it
+local function ownMode()
+	local d = db()
+	if d.mode and d.modeAt and time() - d.modeAt < MODE_TTL then
+		-- in a group: the pick lasts as long as the group, however long the night
+		if inGroup() then d.modeAt = time() end
+		return d.mode
+	end
+	return RatRoll.LITE and "sr" or "roll"
+end
+
+function SR.Mode()
+	-- in a group you follow the setter's mode, once it has told us
+	if inGroup() and not SR.CanSetMode() and remote and remote.from == setterName() then
+		return remote.mode
+	end
+	return ownMode()
+end
+
+local function sendMode()
+	local C = RatRoll.Comms
+	if C and C.Send and inGroup() and SR.CanSetMode() then C.Send("LOOTMODE", ownMode()) end
+end
+
+-- Council IS council night, and every other mode ends it. Only the one who may
+-- run the council switches it; anyone else just changes their own view. Also
+-- run when the master looter changes: Council picked before becoming ML could
+-- not start the night then, and must start it now.
+local function syncNight()
+	local CC = RatRoll.Council
+	if not (CC and CC.SetActive and CC.Enabled and CC.Enabled() and CC.MayRun and CC.MayRun()) then return end
+	local want = (SR.Mode() == "council")
+	if (CC.active and true or false) ~= want then CC.SetActive(want) end
+end
+
+function SR.SetMode(m)
+	if m ~= nil and not MODES[m] then return false end
+	if not SR.CanSetMode() then
+		RatRoll:Print("The loot mode is set by " .. (setterName() or "the master looter") .. ".")
+		return false
+	end
+	m = m or "roll"
+	local was = SR.Mode()
+	db().mode, db().modeAt = m, time()
+	-- A mode change leaves reserve whispers locked: they open with Open or
+	-- Post rules, never by themselves.
+	if was ~= m and SR.SetIntake and SR.IntakeOpen() then SR.SetIntake(false) end
+	syncNight()
+	sendMode()
+	-- The wishlist belongs to Council: SR or Roll pauses it. The wish window
+	-- closes (raiders close theirs on LOOTMODE) and no wish counts, but the raid
+	-- ID keeps it open, locked and listed: a pug between two guild nights must
+	-- not turn the guild's wishlist off or unlock it.
+	if m ~= "council" and SR.PickWindow and SR.PickWindow.HideKind then
+		SR.PickWindow.HideKind("wish")
+	end
+	if SR.onChange then SR.onChange() end
+	if SR.onPanel then SR.onPanel() end
+	local RM = RatRoll.RollMgr
+	if RM and RM.Rebuild then
+		local ok, err = pcall(RM.Rebuild)
+		if not ok and RatRoll.Err then RatRoll:Err("SoftRes SetMode", err) end
+	end
+	return true
+end
+
+-- The setter's mode reaches everyone: LOOTMODE when it changes or when asked
+-- (LOOTMODEQ, sent on joining a group and when the master looter changes).
+local function repaint()
+	if SR.onChange then pcall(SR.onChange) end
+	if SR.onPanel then pcall(SR.onPanel) end
+	local RM = RatRoll.RollMgr
+	if RM and RM.Rebuild then pcall(RM.Rebuild) end
+end
+do
+	local C = RatRoll.Comms
+	if C and C.On then
+		C.On("LOOTMODE", function(sender, mode)
+			sender = shortName(sender)
+			if not MODES[mode] or sender ~= setterName() then return end
+			if remote and remote.mode == mode and remote.from == sender then return end
+			remote = { mode = mode, from = sender }
+			-- no wishes outside Council: the wish window closes
+			if mode ~= "council" and SR.PickWindow and SR.PickWindow.HideKind then
+				pcall(SR.PickWindow.HideKind, "wish")
+			end
+			repaint()
+		end)
+		C.On("LOOTMODEQ", function() sendMode() end)
+	end
+	local f = CreateFrame("Frame")
+	f:RegisterEvent("PARTY_LOOT_METHOD_CHANGED")
+	f:RegisterEvent("PARTY_MEMBERS_CHANGED")
+	f:RegisterEvent("RAID_ROSTER_UPDATE")
+	local lastSetter, wasIn
+	f:SetScript("OnEvent", function()
+		local who, now = setterName(), inGroup()
+		if who == lastSetter and now == wasIn then return end
+		local left = wasIn and not now
+		lastSetter, wasIn = who, now
+		if not now then
+			-- the group is gone: the pick ends with it, after a short grace so a
+			-- roster blink while zoning does not reset the night
+			local d = db()
+			if left and d.mode and d.modeAt then d.modeAt = math.min(d.modeAt, time() - MODE_TTL + DISBAND_GRACE) end
+			remote = nil; repaint(); return
+		end
+		if SR.CanSetMode() then
+			syncNight()
+			sendMode()
+		elseif C and C.Send then C.Send("LOOTMODEQ") end
+		repaint()
+	end)
+end
+
+-- Whether soft reserves count right now. SR mode is also the one that takes
+-- reserves by whisper ("sr [item]"), hence the second name.
+function SR.Active()
+	return SR.Mode() == "sr"
+end
+SR.WhisperMode = SR.Active
+
+-- Whether the loot council may be asked right now.
+function SR.CouncilAllowed()
+	return SR.Mode() == "council"
+end
+
 -- The raiders who reserved this item (id or link), in import order. Empty when
--- the item is not reserved or no list is loaded.
+-- the item is not reserved, no list is loaded, or the mode ignores reserves.
 function SR.For(item)
+	if not SR.Active() then return {} end
 	local id = idOf(item)
 	local d = db()
-	return (id and d.items and d.items[id]) or {}
+	if not (id and d.items) then return {} end
+	if d.items[id] then return d.items[id] end
+	-- The heroic and normal copy of an item are two ids with one name, and in
+	-- ICC or RS a raid kills bosses on either: a reserve is for the item, so it
+	-- is matched by name too.
+	local name = GetItemInfo(id) or (d.names or {})[id]
+	if not name then return {} end
+	for iid, list in pairs(d.items) do
+		if ((d.names or {})[iid] or GetItemInfo(iid)) == name then return list end
+	end
+	return {}
+end
+
+-- ---- Reserves added one at a time (whispers, officer edits) ---------------
+-- Same table an import fills, so tags, tooltips and the roll filter treat a
+-- whispered reserve exactly like an imported one.
+
+-- The item ids this raider has reserved, oldest first.
+function SR.ReservesOf(name)
+	local d, k, out = db(), key(name or ""), {}
+	for _, id in ipairs(d.order or {}) do
+		for _, e in ipairs((d.items or {})[id] or {}) do
+			if e.key == k then out[#out + 1] = { id = id, at = e.at or 0 } end
+		end
+	end
+	table.sort(out, function(a, b) return a.at < b.at end)
+	local ids = {}
+	for i, r in ipairs(out) do ids[i] = r.id end
+	return ids
+end
+
+local function recount(d)
+	local ni, players = 0, {}
+	for _, list in pairs(d.items or {}) do
+		ni = ni + 1
+		for _, e in ipairs(list) do players[e.key] = true end
+	end
+	local np = 0
+	for _ in pairs(players) do np = np + 1 end
+	d.nItems, d.nPlayers = ni, np
+	if SR.onChange then SR.onChange() end
+	if SR.onPanel then SR.onPanel() end
+end
+
+function SR.AddReserve(name, class, id, itemName, boss)
+	id = tonumber(id)
+	if not (id and name and name ~= "") then return false end
+	local d = db()
+	d.items, d.names, d.order, d.bosses = d.items or {}, d.names or {}, d.order or {}, d.bosses or {}
+	d.at = d.at or time()
+	-- the other difficulty's copy already reserved: join that entry, one list per item
+	if not d.items[id] then
+		local nm = itemName or GetItemInfo(id)
+		for iid in pairs(d.items) do
+			if nm and (d.names[iid] or GetItemInfo(iid)) == nm then id = iid; break end
+		end
+	end
+	local list = d.items[id]
+	if not list then
+		list = {}
+		d.items[id] = list
+		local listed = false
+		for _, o in ipairs(d.order) do if o == id then listed = true; break end end
+		if not listed then d.order[#d.order + 1] = id end
+	end
+	local k = key(name)
+	for _, e in ipairs(list) do if e.key == k then return false end end
+	list[#list + 1] = { name = (name:gsub("%-.*$", "")), key = k, class = class, spec = "", note = "",
+		count = 1, at = time() }
+	if itemName and itemName ~= "" then d.names[id] = d.names[id] or itemName end
+	if boss and boss ~= "" then d.bosses[id] = d.bosses[id] or boss end
+	recount(d)
+	return true
+end
+
+-- Drop one reserve (id given) or all of this raider's. Returns the ids removed.
+function SR.RemoveReserve(name, id)
+	local d, k, gone = db(), key(name or ""), {}
+	for iid, list in pairs(d.items or {}) do
+		if not id or iid == tonumber(id) then
+			for i = #list, 1, -1 do
+				if list[i].key == k then table.remove(list, i); gone[#gone + 1] = iid end
+			end
+			if #list == 0 then d.items[iid] = nil end
+		end
+	end
+	if #gone > 0 then recount(d) end
+	return gone
 end
 
 -- Every reserved item id, in the CSV's order when there is one (a received
@@ -387,6 +651,17 @@ local FRAG_IDS = { [45038] = true, [45039] = true, [45896] = true, [50274] = tru
 local ORB_NAMES  = { "runed orb", "crusader orb", "primordial saronite" }
 local FRAG_NAMES = { "fragment of val'anyr", "fragments of val'anyr", "shadowfrost shard" }
 local PATTERN_PREFIX = { "pattern:", "plans:", "recipe:", "schematic:", "formula:", "design:" }
+
+-- Fragments (Val'anyr, Shadowfrost Shard) and orbs (Runed / Crusader orbs,
+-- Primordial Saronite): raid materials, never something a raider reserves.
+function SR.IsMaterial(id, name)
+	if id and (FRAG_IDS[id] or ORB_IDS[id]) then return true end
+	local n = (name or ""):lower()
+	if n == "" then return false end
+	for _, w in ipairs(FRAG_NAMES) do if n:find(w, 1, true) then return true end end
+	for _, w in ipairs(ORB_NAMES) do if n:find(w, 1, true) then return true end end
+	return false
+end
 
 local function hasAny(name, list, prefix)
 	for _, w in ipairs(list) do

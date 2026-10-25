@@ -315,13 +315,10 @@ end
 -- stays on after we're done, which is why the guild tab was suddenly always showing
 -- offline members.
 --
--- 3.3.5a has no reliable getter for the flag, and inferring "did we turn it on?" from
--- the member count is unsound: forcing offline in does NOT change the count when the
--- whole guild is already online, so we could never tell we'd enabled it and would leak
--- it on. So we don't guess -- we ALWAYS restore the WoW default (offline hidden) after
--- walking. Cost: a user who manually ticked "Show Offline" gets it unticked after we
--- run. That is rare and far less bad than the addon silently forcing it on for everyone;
--- if it ever matters, add an explicit opt-out setting.
+-- So every caller brackets its read with ForceShowOffline / RestoreShowOffline, which
+-- read the player's own choice (GetGuildRosterShowOffline) before the first force and
+-- put exactly that back when the last caller is done. The calls nest: an export
+-- polling for seconds and a quick walk inside it restore only once, at the end.
 --
 --   RatRoll:WithFullRoster(function(total) ... GetGuildRosterInfo(i) ... end)
 --
@@ -333,6 +330,30 @@ end
 -- GUILD_ROSTER_UPDATE handler skips its refresh when it sees a roster event we caused
 -- ourselves. Reads only ever set the flag briefly, so a real login/logoff that lands
 -- outside our window still refreshes normally.
+local showOfflineHolds = 0      -- callers currently forcing "Show Offline" on
+local playerShowOffline         -- the player's own choice, read before the first force
+
+function RatRoll:ForceShowOffline()
+	if not SetGuildRosterShowOffline then return end
+	if showOfflineHolds == 0 then
+		playerShowOffline = GetGuildRosterShowOffline and GetGuildRosterShowOffline() and true or false
+	end
+	showOfflineHolds = showOfflineHolds + 1
+	SetGuildRosterShowOffline(true)
+end
+
+function RatRoll:RestoreShowOffline()
+	if not SetGuildRosterShowOffline or showOfflineHolds == 0 then return end
+	showOfflineHolds = showOfflineHolds - 1
+	if showOfflineHolds > 0 then return end
+	SetGuildRosterShowOffline(playerShowOffline and true or false)
+	-- Blizzard's checkbox only reads the flag when the guild tab opens; keep an open
+	-- one in step with what the list now shows.
+	if GuildFrameLFGButton and GuildFrameLFGButton.SetChecked then
+		GuildFrameLFGButton:SetChecked(playerShowOffline and true or false)
+	end
+end
+
 function RatRoll:WithFullRoster(fn)
 	if not (IsInGuild and IsInGuild()) then return end
 	if self.rosterBusy then
@@ -343,10 +364,10 @@ function RatRoll:WithFullRoster(fn)
 		return
 	end
 	self.rosterBusy = true
-	if SetGuildRosterShowOffline then SetGuildRosterShowOffline(true) end
+	self:ForceShowOffline()
 	local total = (GetNumGuildMembers and GetNumGuildMembers()) or 0
 	local ok, err = pcall(fn, total)
-	if SetGuildRosterShowOffline then SetGuildRosterShowOffline(false) end
+	self:RestoreShowOffline()
 	-- Keep the guard up briefly: GUILD_ROSTER_UPDATE from our two toggles arrives
 	-- AFTER we return here (it's async), so clearing rosterBusy now would let that
 	-- late event trigger a refresh -> another WithFullRoster -> the loop. Drop it a
@@ -545,7 +566,7 @@ function RatRoll:SetDevMode(on)
 	self.db.devMode = on and true or false
 	if self.db.devMode then
 		local f = self:DevFrame(true)
-		self:Print("Dev mode |cff7cfc8aON|r"
+		self:Print("Dev mode |cffffd200ON|r"
 			.. (f and (" -- output goes to the |cffe0b860" .. DEV_TAB_NAME .. "|r chat tab.")
 			or " -- |cffff5555could not open a chat tab (all 10 in use); using default chat.|r"))
 	else
@@ -831,14 +852,25 @@ core:SetScript("OnEvent", function(_, event, arg1)
 		end
 
 		if not RatRoll.LITE then
-			RatRoll:Print("loaded -- |cff00ff00/ratroll|r. " .. RatRoll:CountPlugins() .. " plugin(s).")
+			RatRoll:Print("loaded -- |cffffd200/ratroll|r. " .. RatRoll:CountPlugins() .. " plugin(s).")
 		end
 
 		-- A few seconds in, so it lands after the login spam and the loading
 		-- screen rather than under them.
-		if RatRoll.db.setupPending and RatRoll.ShowSetup and RatRoll.Comms and RatRoll.Comms.After then
+		if RatRoll.ShowSetup and RatRoll.Comms and RatRoll.Comms.After then
 			RatRoll.Comms.After(4, function()
-				if RatRoll.db.setupPending and not InCombatLockdown() then RatRoll:ShowSetup() end
+				if InCombatLockdown() then return end
+				local d = RatRoll.db
+				if d.setupPending then
+					RatRoll:ShowSetup()
+				elseif d.tourPending then
+					-- the setup reloaded the UI on its way to the tour
+					d.tourPending = nil
+					if RatRoll.ShowTour then RatRoll:ShowTour() end
+				elseif (d.setupVersion or 1) < (RatRoll.SETUP_VERSION or 1) then
+					-- an update added setup steps: once, opened on the first new one
+					RatRoll:ShowSetup(d.setupVersion or 1)
+				end
 			end)
 		end
 	end
@@ -853,6 +885,10 @@ SlashCmdList["RatRoll"] = function(arg)
 	-- own spelling of its name); only the command word is matched lowercased
 	local raw = (arg or ""):gsub("^%s+", ""):gsub("%s+$", "")
 	arg = raw:lower()
+	if arg == "tour" then
+		if RatRoll.ShowTour then RatRoll:ShowTour() end
+		return
+	end
 	if arg == "setup" then
 		if RatRoll.ShowSetup then
 			RatRoll:ShowSetup()
@@ -912,29 +948,101 @@ SlashCmdList["RatRoll"] = function(arg)
 	if arg == "dev" then
 		local on = not (RatRoll.db.devMode and true or false)
 		RatRoll:SetDevMode(on)
-		RatRoll:Print(on and "dev mode |cff7cfc8aON|r -- debug goes to the |cffe0b860RatRoll|r chat tab."
+		RatRoll:Print(on and "dev mode |cffffd200ON|r -- debug goes to the |cffe0b860RatRoll|r chat tab."
 			or "dev mode |cff8a8d93OFF|r.")
 		return
 	end
-	if arg == "help" or arg == "?" then
-		RatRoll:Print("commands:")
-		RatRoll:Print("  |cffffd200/ratroll|r        open/close the window   |cff8a8d93(/ratroll tab = own chat tab)|r")
-		RatRoll:Print("  |cffffd200/ratroll brand <name>|r  your guild's skin  |cff8a8d93(empty = clear)|r")
-		RatRoll:Print("  |cffffd200/ratroll hub <url>|r     web hub link      |cff8a8d93(empty = clear)|r")
-		RatRoll:Print("  |cffffd200/ratroll dev|r          debug to the RatRoll chat tab")
-		RatRoll:Print("  |cffffd200/rr|r         mini roll manager")
-		RatRoll:Print("  |cffffd200/rrerr|r          error log  |cff8a8d93(clear)|r")
-		RatRoll:Print("  |cffffd200/rrfocus|r    release a stuck keyboard focus")
-			RatRoll:Print("  |cff8a8d93every module opens from the minimap button.|r")
+	if arg == "help" or arg == "?" or arg:find("^help ") then
+		RatRoll:PrintHelp(raw:match("^%S+%s+(.+)$"))
 		return
 	end
 	RatRoll:Toggle()
 end
 
+-- Every slash command, by who uses it. /ratroll help prints it; /ratroll help
+-- <word> only the lines that mention the word. docs/SLASH_COMMANDS.md is the
+-- same list, longer.
+RatRoll.HELP = {
+	{ "Everyone", {
+		{ "/ratroll", "open or close the window" },
+		{ "/ratroll help [word]", "this list (only lines with that word)" },
+		{ "/ratroll tab", "send RatRoll's messages to their own chat tab" },
+		{ "/ratroll setup", "the first-run setup again" },
+		{ "/rr [stop]", "the mini roll window (stop: end the open roll)" },
+		{ "/rrup [item link]", "the Upgrades page, or whether one item is an upgrade" },
+		{ "/rrup phase [T7 .. RS | auto]", "the server's phase, read from the game; set it by hand, or back to auto" },
+		{ "/rrup audit", "check every drop of every open raid for your spec (saved for review)" },
+		{ "/rrup sound", "the toast, rat sound and chat line when an upgrade drops: on / off" },
+		{ "/rrup toast", "show the upgrade toast once, to see it and drag it into place" },
+		{ "/rrup bis", "BiS list lines on item tooltips (every spec): on / off" },
+		{ "/rrup fits", "the stars (who an item fits) on item tooltips: on / off" },
+		{ "/rrup drops", "the boss and instance lines on item tooltips: on / off" },
+		{ "/rrids tips", "spell and item IDs on tooltips (ID Finder module): on / off" },
+		{ "/rrtrade [clear]", "loot you still owe by trade, and to whom" },
+		{ "/rrrc [list | say | aura]", "raid check: the popup, a list, announce, your buffs" },
+		{ "/rrnotes [send | unlock | watch]", "boss notes: status, send, unlock editing, watch the timers" },
+		{ "/rrfarm start | stop | reset", "farm session: gold and items per hour" },
+		{ "/rrver", "who runs RatRoll, and which version" },
+		{ "/rrerr [clear]", "the error log (clear: empty it)" },
+		{ "/rrfocus", "free the keyboard if a text box is stuck on it" },
+	} },
+	{ "PuG leader", {
+		{ "/pug start | stop", "start or stop spamming the LFM line" },
+		{ "/pug send", "send the LFM line once" },
+		{ "/pug msg", "print the line that would be sent" },
+	} },
+	{ "Master looter / officer", {
+		{ "/rrsr mode council | sr | roll", "tonight's loot mode" },
+		{ "/rrsr open | lock", "take or stop \"sr [item]\" whispers" },
+		{ "/rrsr post | list", "raid chat: the SR rules, or every reserve" },
+		{ "/rrsr", "the soft-reserve list beside the mini roll" },
+		{ "/rrwish on | off", "wishlist for the council (raiders get the window, or whisper wh [item])" },
+		{ "/rrwish clear", "clear every wish on this raid ID" },
+		{ "/rrcouncil board | close", "reopen the council board, or end the round" },
+		{ "/rrcouncil auto on | off", "ask the council about every epic when a corpse opens" },
+		{ "/rrcouncil ask [item links]", "a council round on items already in bags" },
+	} },
+	{ "Guild skin", {
+		{ "/ratroll brand <name>", "your guild's name on the window (empty: clear)" },
+		{ "/ratroll hub <url>", "your guild's web hub link (empty: clear)" },
+		{ "/ratroll generic", "clear the guild skin and the web hub" },
+	} },
+	{ "Testing, solo", {
+		{ "/rrcouncil test [n] | test off", "a council round on gear you wear, nothing given" },
+		{ "/rrsr test | test raider | test off", "a soft-reserve night, or its window as a raider" },
+		{ "/rrsr test w <name> sr [item]", "fake a reserve whisper" },
+		{ "/rrwish test", "your wish window" },
+		{ "/pug mock", "five fake players in the group" },
+		{ "/rrloottest [id | name | world | ml | roll | clear]", "fake drops in the loot list" },
+		{ "/ratroll dev", "debug output to the RatRoll chat tab" },
+		{ "/rrcomms", "every RatRoll addon message as it arrives" },
+	} },
+}
+
+function RatRoll:PrintHelp(filter)
+	filter = filter and filter:lower() or nil
+	self:Print(filter and ("commands with \"" .. filter .. "\":") or "commands:")
+	local any = false
+	for _, g in ipairs(RatRoll.HELP) do
+		local lines = {}
+		for _, c in ipairs(g[2]) do
+			if not filter or (c[1] .. " " .. c[2]):lower():find(filter, 1, true) then
+				lines[#lines + 1] = "  |cffffd200" .. c[1] .. "|r  |cff8a8d93" .. c[2] .. "|r"
+			end
+		end
+		if #lines > 0 then
+			any = true
+			self:Print("|cffe0b860" .. g[1] .. "|r")
+			for _, l in ipairs(lines) do self:Print(l) end
+		end
+	end
+	if not any then self:Print("|cff8a8d93nothing matches.|r") end
+end
+
 -- Emergency keyboard release: if anything ever traps the keyboard again, this
 -- clears our tracked boxes AND force-releases any lingering focus. Type /rrfocus.
-SLASH_OKFOCUS1 = "/rrfocus"
-SlashCmdList["OKFOCUS"] = function()
+SLASH_RRFOCUS1 = "/rrfocus"
+SlashCmdList["RRFOCUS"] = function()
 	RatRoll:ClearAllFocus()
 	RatRoll:Print("released keyboard focus.")
 end
@@ -949,14 +1057,14 @@ end
 -- Not council-specific: a version mismatch is the first thing to rule out for
 -- ANY "it works for me but not for him" report, and the window was previously
 -- reachable only by opening the Settings page and scrolling to find it.
-SLASH_OKVER1 = "/rrver"
-SlashCmdList["OKVER"] = function()
+SLASH_RRVER1 = "/rrver"
+SlashCmdList["RRVER"] = function()
 	if RatRoll.ShowVersionChecker then RatRoll:ShowVersionChecker()
 	else RatRoll:Print("|cffff5555Version checker unavailable.|r") end
 end
 
-SLASH_OKERR1 = "/rrerr"
-SlashCmdList["OKERR"] = function(arg)
+SLASH_RRERR1 = "/rrerr"
+SlashCmdList["RRERR"] = function(arg)
 	arg = (arg or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
 	if arg == "clear" then
 		RatRoll:ClearErrors()
@@ -965,7 +1073,7 @@ SlashCmdList["OKERR"] = function(arg)
 	end
 	local report = RatRoll:ErrorReport()
 	if not report then
-		RatRoll:Print("No errors recorded. |cff7cfc8aNice.|r")
+		RatRoll:Print("No errors recorded. |cffffd200Nice.|r")
 		return
 	end
 	if RatRoll.ShowExport then

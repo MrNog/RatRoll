@@ -42,12 +42,17 @@ FILES = [
     r"Modules\Loot.lua",
     r"Modules\LootSync.lua",
     r"Modules\LootRoll.lua",
+    r"Modules\LootGive.lua",
     r"Modules\SoftRes-UI.lua",
     r"Modules\LootTrade.lua",
     r"Modules\RaidLoot-Data.lua",
 ]
 
-MEDIA = []   # Okanvil media RatRoll needs (its own art is in src/Media)
+# Okanvil media RatRoll needs (its own art is in src/Media): the UI kit textures
+# the widgets draw with -- every .blp in Media/UI, so a new one is picked up too.
+MEDIA = sorted("UI/" + f.name for f in (OKANVIL / "Media" / "UI").glob("*.blp")) + [
+    "roll-bg.blp",   # the roll window's rat with dice
+]
 
 # Slash commands: the two used every raid get short names, the rest /okX -> /rrX.
 SLASH = {"okroll": "rr", "okres": "rrsr", "okanvil": "ratroll"}
@@ -58,6 +63,10 @@ GUARD = "if RATROLL_OFF then return end"
 def rename(text):
     text = text.replace('"Okanvil - Roll"', '"RatRoll"')
     text = re.sub(r"/ok([a-z]+)", lambda m: "/" + SLASH.get("ok" + m.group(1), "rr" + m.group(1)), text)
+    # The slash globals too (SLASH_OKROLL1, SlashCmdList["OKROLL"]): with Okanvil's
+    # names, whichever addon loads last would take the other's commands.
+    text = re.sub(r"SLASH_OK([A-Z]+)", r"SLASH_RR\1", text)
+    text = re.sub(r'SlashCmdList\["OK([A-Z]+)"\]', r'SlashCmdList["RR\1"]', text)
     # The addon-message prefix is "OKANVIL" (upper case) and is NOT touched:
     # that is what lets RatRoll and Okanvil talk to each other.
     return text.replace("Okanvil", "RatRoll")
@@ -100,7 +109,7 @@ def main():
         dst.parent.mkdir(parents=True, exist_ok=True)
         dst.write_text(add_guard(rename(text), rel), encoding="utf-8", newline="")
 
-    (OUT / "Media").mkdir()
+    (OUT / "Media" / "UI").mkdir(parents=True)
     for name in MEDIA:
         shutil.copy2(OKANVIL / "Media" / name, OUT / "Media" / name)
     # RatRoll's window art (Boot.lua points W.ForgeArt at it)

@@ -194,7 +194,7 @@ end
 -- Debug: /rrcomms shows every RatRoll addon message as it arrives. Off by
 -- default; it is a firehose in a raid.
 C.debug = false
-_G.SLASH_OKCOMMS1 = "/rrcomms"
+_G.SLASH_RRCOMMS1 = "/rrcomms"
 -- Chat treats '|' as the start of a colour or link code, so a raw payload
 -- printed as-is can come out garbled or not at all. "||" prints one '|'.
 local function shown(s)
@@ -213,7 +213,7 @@ local function ping()
 	pingSeq = pingSeq + 1
 	SendAddonMessage(PREFIX, "PING:plain:" .. pingSeq, chan)
 	SendAddonMessage(PREFIX, "PING|pipe|" .. pingSeq, chan)
-	RatRoll:Print(("Ping %d sent on %s -- expect two lines back: |cff7cfc8aplain|r and |cff7cfc8apipe|r."):format(pingSeq, chan))
+	RatRoll:Print(("Ping %d sent on %s -- expect two lines back: |cffffd200plain|r and |cffffd200pipe|r."):format(pingSeq, chan))
 end
 
 do
@@ -222,15 +222,15 @@ do
 	raw:SetScript("OnEvent", function(_, _, prefix, message, channel, sender)
 		if prefix ~= PREFIX or type(message) ~= "string" or message:sub(1, 4) ~= "PING" then return end
 		local kind = message:sub(5, 5) == "|" and "pipe" or "plain"
-		RatRoll:Print(("|cff7cfc8aPing back:|r %s from %s [%s] %s"):format(
+		RatRoll:Print(("|cffffd200Ping back:|r %s from %s [%s] %s"):format(
 			kind, tostring(sender), tostring(channel), shown(message)))
 	end)
 end
 
-_G.SlashCmdList["OKCOMMS"] = function(msg)
+_G.SlashCmdList["RRCOMMS"] = function(msg)
 	if (msg or ""):lower():match("^%s*ping") then ping(); return end
 	C.debug = not C.debug
-	RatRoll:Print("Comms debug " .. (C.debug and "|cff7cfc8aON|r" or "|cffff5555OFF|r"))
+	RatRoll:Print("Comms debug " .. (C.debug and "|cffffd200ON|r" or "|cffff5555OFF|r"))
 end
 
 local function onMessage(prefix, message, channel, sender)
@@ -447,6 +447,32 @@ C.On("VERR", function(sender, ver)
 	if C.onVersionReply then C.onVersionReply() end
 end)
 
+-- Patch-Y, the guild's client patch (Data\patch-y.mpq), carries its own addon,
+-- !PyAndre, which answers "REQ" on its prefix with "VER:<version>" by whisper.
+-- The version check asks it too, so a raider shows up whatever RatRoll they run;
+-- no answer = no patch, or its addon switched off.
+local PY_PREFIX, PY_ADDON = "PCHY_A", "!PyAndre"
+local pyReplies = {}       -- name -> Patch-Y version
+C.PatchYReplies = function() return pyReplies end
+local pyFrame = CreateFrame("Frame")
+pyFrame:RegisterEvent("CHAT_MSG_ADDON")
+pyFrame:SetScript("OnEvent", function(_, _, prefix, msg, _, sender)
+	if prefix ~= PY_PREFIX or not (msg and sender) then return end
+	local ver = msg:match("^VER:(.*)$")
+	if not ver then return end
+	pyReplies[(sender:gsub("%-.*$", ""))] = ver ~= "" and ver or "?"
+	if C.onVersionReply then C.onVersionReply() end
+end)
+local function askPatchY(chan)
+	wipe(pyReplies)
+	-- our own: the addon is loaded or it is not
+	local me = UnitName and UnitName("player")
+	if me and IsAddOnLoaded and IsAddOnLoaded(PY_ADDON) then
+		pyReplies[me] = GetAddOnMetadata(PY_ADDON, "Version") or "?"
+	end
+	SendAddonMessage(PY_PREFIX, "REQ", chan)
+end
+
 -- Kick off a check. `scope` is "group" (default) or "guild"; `onDone(replies)`
 -- fires after `timeout` seconds (default 5). Returns false when there is nobody
 -- to ask (solo for "group", unguilded for "guild").
@@ -467,6 +493,7 @@ function C.RequestVersions(scope, onDone, timeout)
 	if me then verReplies[me] = tostring(RatRoll.version or "?") end
 	verRunning = true
 	wire(pack("VERQ"), chan)
+	askPatchY(chan)
 	C.After(timeout or 5, function()
 		verRunning = false
 		-- The checker alone learns whether a newer build is out.
@@ -479,6 +506,57 @@ function C.RequestVersions(scope, onDone, timeout)
 		if type(onDone) == "function" then onDone(verReplies) end
 	end)
 	return true
+end
+
+-- ------------------------------------------------------------
+-- Automatic update notice. Each client says its version once on login, on the
+-- hidden addon channel to the guild. Whoever hears a newer build than their own
+-- sees the toast in their own client, once per session -- nobody is ever sent a
+-- chat line. When an older build logs in, ONE newer client answers on the same
+-- channel: each waits a random moment and stays quiet if someone else already
+-- answered, so a login costs a couple of messages, not one whisper per guildie.
+-- The lite build numbers itself separately, so it neither says nor hears this.
+-- ------------------------------------------------------------
+local verToasted = false
+local verAnswerAt = 0      -- GetTime() of the last VERA heard, for the dedupe
+
+local function toastWhenCalm(newest)
+	if verToasted then return end
+	-- passive work waits out the fight: a toast mid-pull is noise
+	if UnitAffectingCombat and UnitAffectingCombat("player") then
+		C.After(10, function() toastWhenCalm(newest) end)
+		return
+	end
+	verToasted = true
+	showUpdateToast(newest)
+	RatRoll:Print(("|cffe0b860RatRoll %s is available|r (you have %s) -- %s")
+		:format(newest, tostring(RatRoll.version or "?"), RatRoll.DOWNLOAD_URL))
+end
+
+C.On("VERA", function(sender, ver)
+	if RatRoll.LITE or not verParts(ver) then return end
+	verAnswerAt = GetTime() or 0
+	local mine = RatRoll.version
+	if verOlder(mine, ver) then
+		toastWhenCalm(ver)
+	elseif verOlder(ver, mine) then
+		local heard = verAnswerAt
+		C.After(2 + math.random() * 6, function()
+			if verAnswerAt ~= heard then return end   -- someone else answered
+			C.SendGuild("VERA", tostring(mine))
+		end)
+	end
+end)
+
+do
+	local f = CreateFrame("Frame")
+	f:RegisterEvent("PLAYER_ENTERING_WORLD")
+	f:SetScript("OnEvent", function(self)
+		self:UnregisterEvent("PLAYER_ENTERING_WORLD")
+		if RatRoll.LITE or not verParts(RatRoll.version) then return end
+		-- the guild roster is not ready the moment we zone in
+		C.After(20, function() C.SendGuild("VERA", tostring(RatRoll.version)) end)
+	end)
 end
 
 -- Everyone we asked, for "who didn't reply". scope mirrors RequestVersions:

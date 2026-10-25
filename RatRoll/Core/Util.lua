@@ -11,10 +11,14 @@ if RATROLL_OFF then return end -- generated from Okanvil/Core/Util.lua, edit the
 --   RatRoll.U.itemIDFromLink(l) -> numeric item id from a link (0 if none)
 --   RatRoll.U.shortLink(l)      -> the "item:1234:..." span of a link (nil if none)
 --   RatRoll.U.guildRankOf(n)    -> that member's rankIndex (nil if not in guild)
---   RatRoll.U.isOfficer(n)      -> rankIndex <= 1 (guild master or officer)
+--   RatRoll.U.isOfficer(n)      -> on a rank with officer chat (guild master included)
+--   RatRoll.U.isOfficerRank(i)  -> that rank index is an officer rank
+--   RatRoll.U.raiderRank()      -> the raider rank: first non-alt rank below the officers
 --   RatRoll.U.mainOf(n)         -> the main an alt belongs to (from guild notes)
+--   RatRoll.U.toonsOf(n)        -> that person's main and alts, main first
 --   RatRoll.U.isOfficerAlt(n)   -> an alt whose main is an officer
 --   RatRoll.U.canSeePrio(n)     -> may see the loot priority list
+--   RatRoll.U.raidMode()        -> "10n" / "25n" / "10h" / "25h" in a raid, else nil
 -- ============================================================
 
 local RatRoll = RatRoll
@@ -33,6 +37,87 @@ end
 -- into a matcher at runtime.
 function U.escPattern(t)
 	return (tostring(t or ""):gsub("([%%%(%)%.%+%-%*%?%[%]%^%$])", "%%%1"))
+end
+
+-- Break text into lines of at most `width` characters, splitting on spaces.
+-- GameTooltip's own wrap cuts a long line off with "..." after a few rows, so
+-- callers that need the whole text add these lines one by one, unwrapped.
+-- A single word longer than `width` gets a line to itself, uncut.
+-- A chat link ("|c..|H..|h[The Light of Dawn]|h|r") is one unbreakable word:
+-- split across lines its escape codes break and the name shows half-coloured
+-- or not at all. Width counts visible characters, not the hidden codes.
+local function visibleLen(s)
+	return #(s:gsub("|c%x%x%x%x%x%x%x%x", ""):gsub("|r", ""):gsub("|H.-|h", ""):gsub("|h", ""))
+end
+
+function U.wrapLines(text, width)
+	text = tostring(text or "")
+	-- protect spaces inside links so the word split below keeps each link whole
+	text = text:gsub("|H.-|h.-|h", function(link) return (link:gsub(" ", "\1")) end)
+	local lines, cur, curLen = {}, "", 0
+	for word in text:gmatch("%S+") do
+		word = word:gsub("\1", " ")
+		local len = visibleLen(word)
+		if cur == "" then
+			cur, curLen = word, len
+		elseif curLen + 1 + len <= width then
+			cur, curLen = cur .. " " .. word, curLen + 1 + len
+		else
+			lines[#lines + 1] = cur
+			cur, curLen = word, len
+		end
+	end
+	if cur ~= "" then lines[#lines + 1] = cur end
+	return lines
+end
+
+-- Class words in LFM spam ("Ppala", "BOOMIE", "Resto Sham") painted in their
+-- class colour, so a long message reads by role at a glance. Only whole letter
+-- runs match, and words carrying escape codes (links, colours) are left alone.
+local CLASS_WORD_HEX = {}
+local function classWords(hex, list)
+	for w in list:gmatch("%S+") do CLASS_WORD_HEX[w] = hex end
+end
+classWords("c41f3b", "dk dks bdk fdk udk deathknight deathknights")
+classWords("ff7d0a", "druid druids dudu rdudu rdruid boomie boomies boomy boomkin boomkins moonkin feral ferals bear kitty")
+classWords("abd473", "hunter hunters hunt hunts")
+classWords("69ccf0", "mage mages fmage amage")
+classWords("f58cba", "pala palas pal paladin paladins pally pallies ppala ppal hpala hpal hpally ppally ret rets retri")
+classWords("ffffff", "priest priests spriest spriests hpriest dpriest disc")
+classWords("fff569", "rogue rogues rog")
+classWords("0070de", "sham shams shaman shamans shammy rsham esham ele enh enha")
+classWords("9482c9", "lock locks warlock warlocks wl demo affli")
+classWords("c79c6e", "warr warrs warrior warriors fwarr pwarr fury arms")
+
+-- One letter run. Spam glues a count and a spec letter on: "1xHpala" reaches here
+-- as "xHpala", "1xRshaman" as "xRshaman". So the run is tried as it is, then
+-- without a leading "x" (the count's), then -- only after such an "x", where it is
+-- surely spam -- without the spec's letter too (R-shaman, C-rog). A plain word
+-- is never cut down into a class ("warms" stays "warms").
+local function paintRun(run)
+	local low = run:lower()
+	local hex = CLASS_WORD_HEX[low]
+	local lead = ""
+	if not hex and low:sub(1, 1) == "x" and #low > 2 then
+		lead, low = run:sub(1, 1), low:sub(2)
+		hex = CLASS_WORD_HEX[low]
+	end
+	if not hex and lead ~= "" and #low >= 4 then
+		hex = CLASS_WORD_HEX[low:sub(2)]
+	end
+	if not hex then return run end
+	-- the count's "x" stays uncoloured; the spec letter is painted with its class
+	return lead .. "|cff" .. hex .. run:sub(#lead + 1) .. "|r"
+end
+
+function U.paintClasses(text)
+	text = tostring(text or "")
+	return (text:gsub("%S+", function(word)
+		if word:find("|", 1, true) then return word end
+		return (word:gsub("%a+", function(run)
+			return paintRun(run)
+		end))
+	end))
 end
 
 -- Accepts a link, a bare "item:50735", or a plain item ID (string or number).
@@ -158,16 +243,59 @@ end
 -- ------------------------------------------------------------
 -- Who is allowed to see officer-only material (the loot priority list).
 --
--- By rank INDEX, not rank name: 0 is the guild master and 1 the officer rank
--- below him, whatever the guild has called them this month. Matching on names
--- would break the day someone renames a rank.
+-- An officer rank is one the guild itself gave officer chat to, read from the
+-- rank's own permissions. Not by name and not by a fixed index: a guild can add,
+-- rename or reorder ranks in game and the answer follows with no code change.
+-- When the client cannot give the permissions, the top two ranks (guild master
+-- and the rank below) stand in.
 --
 -- This hides material from people who have no use for it, and stops a stale list
 -- overwriting a good one. It is NOT a security boundary: the roster comes from
 -- the player's own client and an addon on someone's disk can be edited. Anything
 -- that truly must not leak belongs behind the website's login, not in here.
 -- ------------------------------------------------------------
-local OFFICER_MAX_RANK = 1
+local FALLBACK_OFFICER_MAX_RANK = 1
+-- GuildControlGetRankFlags order: 1 guild chat listen, 3 officer chat listen
+local FLAG_GCHAT_LISTEN, FLAG_OCHAT_LISTEN = 1, 3
+
+-- { [rankIndex] = true } for every officer rank, or nil when the permissions
+-- could not be read. Ranks are numbered from 1 (guild master) in the
+-- guild-control calls and from 0 in the roster.
+local officerRanksCache
+local function officerRanks()
+	if officerRanksCache then return officerRanksCache end
+	if not (GuildControlGetNumRanks and GuildControlSetRank and GuildControlGetRankFlags) then return nil end
+	-- Selecting a rank moves the guild-control frame's own selection: leave it alone
+	-- while the guild master has it open.
+	if GuildControlPopupFrame and GuildControlPopupFrame:IsShown() then return nil end
+	local n = GuildControlGetNumRanks() or 0
+	if n <= 0 then return nil end
+	local set = {}
+	for order = 1, n do
+		GuildControlSetRank(order)
+		local flags = { GuildControlGetRankFlags() }
+		-- the guild master always hears guild chat; if not, nothing was read
+		if order == 1 and not flags[FLAG_GCHAT_LISTEN] then return nil end
+		if order == 1 or flags[FLAG_OCHAT_LISTEN] then set[order - 1] = true end
+	end
+	officerRanksCache = set
+	return set
+end
+do
+	local f = CreateFrame("Frame")
+	-- rank permissions arrive with the roster, so a change in game shows up here
+	f:RegisterEvent("GUILD_ROSTER_UPDATE")
+	f:RegisterEvent("PLAYER_GUILD_UPDATE")
+	f:SetScript("OnEvent", function() officerRanksCache = nil end)
+end
+
+-- Is this rank index an officer rank?
+function U.isOfficerRank(idx)
+	if idx == nil then return false end
+	local set = officerRanks()
+	if set then return set[idx] == true end
+	return idx <= FALLBACK_OFFICER_MAX_RANK
+end
 
 -- ------------------------------------------------------------
 -- Guild ranks, read from the guild -- never assumed.
@@ -254,7 +382,7 @@ end
 -- whether an incoming priority list may be trusted.
 function U.isOfficer(name)
 	local idx = U.guildRankOf(name)
-	return idx ~= nil and idx <= OFFICER_MAX_RANK
+	return U.isOfficerRank(idx)
 end
 
 -- The MAIN an alt belongs to, from its guild notes -- "<Main> alt" in the officer
@@ -271,6 +399,29 @@ function U.mainOf(name)
 		end
 	end
 	return nil
+end
+
+-- One person's toons: their main, then every alt whose notes name that main.
+-- Outside a guild (or with no notes), just the name given.
+function U.toonsOf(name)
+	name = name and (name:gsub("%-.*$", ""))
+	if not (name and name ~= "") then return {} end
+	local main = U.mainOf(name) or name
+	local out = { main }
+	if IsInGuild and IsInGuild() then
+		local alts = {}
+		for n in pairs(roster()) do
+			if n ~= main and U.mainOf(n) == main then alts[#alts + 1] = n end
+		end
+		table.sort(alts)
+		for _, n in ipairs(alts) do out[#out + 1] = n end
+	end
+	if name ~= main then
+		local found = false
+		for _, n in ipairs(out) do if n == name then found = true end end
+		if not found then out[#out + 1] = name end
+	end
+	return out
 end
 
 -- An officer's alt is ranked as an alt, so rank alone would lock the owner of the
@@ -316,8 +467,40 @@ function U.lowestRankIndex()
 	return (maxIdx >= 0) and maxIdx or nil
 end
 
+-- The raider rank: the first rank below the officers that is not an alt rank
+-- ("alt" in its name), never the bottom rank. Members at or above it count as
+-- raiders. nil outside a guild.
+function U.raiderRank()
+	local names, maxIdx = U.guildRanks()
+	if maxIdx < 0 then return nil end
+	local top = 0
+	for i = 0, maxIdx do if U.isOfficerRank(i) then top = i end end
+	local r = top + 1
+	while r < maxIdx and names[r] and names[r]:lower():find("alt", 1, true) do r = r + 1 end
+	if maxIdx >= 2 and r >= maxIdx then r = maxIdx - 1 end
+	return math.min(r, maxIdx)
+end
+
 -- The gate the loot-priority UI asks: an officer, or an officer's alt.
 function U.canSeePrio(name)
 	name = name or UnitName("player") or ""
 	return U.isOfficer(name) or U.isOfficerAlt(name)
+end
+
+-- The raid difficulty we are in, as the loot tables write it ("25h"), or nil
+-- outside a raid. ICC and the Ruby Sanctum switch to heroic inside the instance:
+-- there GetInstanceInfo gives the size in `difficulty` (1 = 10, 2 = 25) and the
+-- heroic switch apart (dynamicDifficulty 1), as DBM reads it. The raid difficulty
+-- set on the portrait counts as well, so heroic shows as soon as it is set.
+function U.raidMode()
+	if not GetInstanceInfo then return nil end
+	local _, itype, diff, _, maxPlayers, dyn, isDyn = GetInstanceInfo()
+	if itype ~= "raid" then return nil end
+	local size = (maxPlayers == 25 or diff == 2 or diff == 4) and 25 or 10
+	local hc = diff == 3 or diff == 4
+	if isDyn then
+		local set = GetRaidDifficulty and GetRaidDifficulty()
+		hc = dyn == 1 or set == 3 or set == 4
+	end
+	return size .. (hc and "h" or "n")
 end

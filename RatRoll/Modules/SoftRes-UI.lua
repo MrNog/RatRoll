@@ -17,10 +17,10 @@ local SR = RatRoll.SoftRes
 local P = {}
 RatRoll.SoftResPanel = P
 
-local PANEL_W, PAD, ICON, GAP = 290, 8, 20, 6
+local PANEL_W, PAD, ICON, GAP = 290, 8, 32, 10
 -- MAX_H fits ~12 reserved items before the list scrolls (a 10-man list, usually)
 local MIN_H, MAX_H, HDR_H = 140, 560, 26
-local NAMES_W = PANEL_W - PAD * 2 - ICON - GAP - 10   -- 10 = the scrollbar lane
+local NAMES_W = PANEL_W - PAD * 2 - ICON - GAP - 12   -- 10 = the scrollbar lane
 
 local panel
 
@@ -32,9 +32,12 @@ end
 
 local function rollWin() return _G.RatRoll_RollMgr end
 
+-- who sees the list: the master looter, an officer or the raid leader (as WH)
 local function isML()
 	local RM = RatRoll.RollMgr
-	return RM and RM.IsML and RM.IsML() or false
+	if RM and RM.IsML and RM.IsML() then return true end
+	local Wi = RatRoll.Wish
+	return Wi and Wi.CanSee and Wi.CanSee() or false
 end
 
 local function classColor(token)
@@ -90,24 +93,28 @@ local function build()
 	if br then f:SetBackdropColor(br, bg, bb, 0.97) end
 	f:EnableMouse(true)
 	f:SetClampedToScreen(true)
-	W.ForgeArt(f, 0.22)
+	W.ForgeArt(f, 0.22, W.LOOT_ART)
 
-	local hdr = W.Frame(f, "bare")
-	hdr:SetPoint("TOPLEFT", 1, -1); hdr:SetPoint("TOPRIGHT", -1, -1); hdr:SetHeight(HDR_H)
-	W.Hairline(hdr, "BOTTOM", 8)
-	local title = W.Text(hdr, "Soft reserves", "body", "accent")
-	title:SetPoint("LEFT", PAD, 0); title:Color(1, 0.82, 0)
-	local close = W.Button(hdr, "X"); close:SetSize(22, 20); close:SetPoint("RIGHT", -3, 0)
+	-- the mini roll's title bar: buttons sit inside it, 6px in from the window edge
+	local hdr = W.TitleBar(f, HDR_H)
+	local title = hdr.title
+	title:ClearAllPoints(); title:SetPoint("LEFT", 10, 0); title:SetJustifyH("LEFT")
+	title:SetText("Soft reserves")
+	local close = W.CloseButton(hdr); close:SetSize(20, 20); close:SetPoint("RIGHT", -3, 0)
 	close:SetScript("OnClick", function() P.Hide(true) end)
-	local csv = W.Button(hdr, "CSV"); csv:SetSize(38, 20); csv:SetPoint("RIGHT", close, "LEFT", -4, 0)
+	local csv = W.Button(hdr, "CSV"); csv:SetSize(34, 18); csv:SetPoint("RIGHT", close, "LEFT", -4, 0)
 	csv:Tooltip("Load the soft reserves: paste the CSV from softres.it\n(Export > CSV). It replaces the list you have.")
 	csv:SetScript("OnClick", function() P.SetImporting(not f.importing) end)
 	f.count = W.Text(hdr, "", "note", "dim")
-	f.count:SetPoint("RIGHT", csv, "LEFT", -8, 0)
+	-- between the title and CSV, never over the title: a long count is cut
+	f.count:SetPoint("LEFT", title, "RIGHT", 8, 0)
+	f.count:SetPoint("RIGHT", csv, "LEFT", -6, 0)
+	f.count:SetJustifyH("RIGHT")
+	if f.count.SetWordWrap then f.count:SetWordWrap(false) end
 
 	-- The paste view takes the list's place while it is open.
 	local imp = CreateFrame("Frame", nil, f)
-	imp:SetPoint("TOPLEFT", PAD, -(HDR_H + 6)); imp:SetPoint("BOTTOMRIGHT", -PAD, PAD)
+	imp:SetPoint("TOPLEFT", PAD, -(HDR_H + 12)); imp:SetPoint("BOTTOMRIGHT", -PAD, PAD)
 	local hint = W.Text(imp, "softres.it: Export > CSV, then paste it here.", "note", "dim")
 	hint:SetPoint("TOPLEFT", 0, 0)
 	local box = W.MultiEdit(imp)
@@ -129,14 +136,14 @@ local function build()
 
 	-- flat scroll: plain ScrollFrame, our own thumb, the wheel moves it
 	local sf = CreateFrame("ScrollFrame", nil, f)
-	sf:SetPoint("TOPLEFT", PAD, -(HDR_H + 6)); sf:SetPoint("BOTTOMRIGHT", -PAD - 6, PAD)
+	sf:SetPoint("TOPLEFT", PAD, -(HDR_H + 12)); sf:SetPoint("BOTTOMRIGHT", -PAD - 6, PAD)
 	local child = CreateFrame("Frame", nil, sf)
 	child:SetWidth(PANEL_W - PAD * 2 - 6); child:SetHeight(1)
 	sf:SetScrollChild(child)
 	RatRoll.Clip(sf)
 
 	local sb = CreateFrame("Slider", nil, f)
-	sb:SetPoint("TOPRIGHT", -4, -(HDR_H + 6)); sb:SetPoint("BOTTOMRIGHT", -4, PAD); sb:SetWidth(4)
+	sb:SetPoint("TOPRIGHT", -4, -(HDR_H + 12)); sb:SetPoint("BOTTOMRIGHT", -4, PAD); sb:SetWidth(4)
 	sb:SetOrientation("VERTICAL"); sb:SetValueStep(1); sb:SetMinMaxValues(0, 0); sb:SetValue(0)
 	local th = sb:CreateTexture(nil, "OVERLAY")
 	th:SetTexture("Interface\\Buttons\\WHITE8x8")
@@ -145,7 +152,7 @@ local function build()
 	sb:SetThumbTexture(th)
 	sb:SetScript("OnValueChanged", function(_, v) sf:SetVerticalScroll(v) end)
 	sf:EnableMouseWheel(true)
-	sf:SetScript("OnMouseWheel", function(_, dz) sb:SetValue(sb:GetValue() - dz * 30) end)
+	sf:SetScript("OnMouseWheel", function(_, dz) sb:SetValue(sb:GetValue() - dz * 60) end)
 
 	f.sf, f.child, f.sb = sf, child, sb
 	f.heads, f.rows = {}, {}
@@ -179,22 +186,22 @@ local function rowAt(i)
 	local r = panel.rows[i]
 	if r then return r end
 	r = CreateFrame("Frame", nil, panel.child)
-	r.icon = r:CreateTexture(nil, "ARTWORK")
-	r.icon:SetSize(ICON, ICON); r.icon:SetPoint("TOPLEFT", 0, -3)
-	r.icon:SetTexCoord(0.07, 0.93, 0.07, 0.93)
+	r.slot = W.FramedIcon(r, nil, ICON)
+	r.slot:SetPoint("TOPLEFT", 2, -3)
+	r.icon = r.slot.icon
 	r.status = W.Text(r, "", "note")
 	-- a few px in: the scroll area clips at its edge, and the last letter of
 	-- a name drawn flush against it was cut
 	r.status:SetPoint("TOPRIGHT", -4, -3)
 	r.status:SetJustifyH("RIGHT")
 	r.name = W.Text(r, "", 11)
-	r.name:SetPoint("TOPLEFT", r.icon, "TOPRIGHT", GAP, 0)
+	r.name:SetPoint("TOPLEFT", r.slot, "TOPRIGHT", GAP, -2)
 	r.name:SetPoint("RIGHT", r.status, "LEFT", -6, 0)
 	r.name:SetJustifyH("LEFT")
 	if r.name.SetWordWrap then r.name:SetWordWrap(false) end
 	-- the whole list, wrapped: this is what the panel is for
 	r.who = W.Text(r, "", "note")
-	r.who:SetPoint("TOPLEFT", r.name, "BOTTOMLEFT", 0, -3)
+	r.who:SetPoint("TOPLEFT", r.name, "BOTTOMLEFT", 0, -4)
 	r.who:SetWidth(NAMES_W)
 	r.who:SetJustifyH("LEFT")
 	panel.rows[i] = r
@@ -283,7 +290,7 @@ function P.Refresh()
 				for _, x in ipairs(SR.For(it.id)) do if x.key == who:lower() then e = x end end
 				w[#w + 1] = classColor(e and e.class) .. who .. "|r"
 			end
-			r.status:SetText("|cff7cfc8awon|r " .. table.concat(w, ", "))
+			r.status:SetText("|cffffd200won|r " .. table.concat(w, ", "))
 		elseif s then
 			r.status:SetText("|cffffd200dropped" .. (s.n > 1 and (" x" .. s.n) or "") .. "|r")
 		else
@@ -302,10 +309,10 @@ function P.Refresh()
 		end
 		r.who:SetText(table.concat(names, "|cff6f7176, |r"))
 
-		local rh = math.max(ICON + 6, 3 + (r.name:GetStringHeight() or 12) + 3 + (r.who:GetStringHeight() or 10) + 6)
+		local rh = math.max(ICON + 6, 5 + (r.name:GetStringHeight() or 12) + 4 + (r.who:GetStringHeight() or 10) + 6)
 		r:SetPoint("TOPLEFT", 0, -y); r:SetWidth(width); r:SetHeight(rh)
 		r:Show()
-		y = y + rh + 2
+		y = y + rh + 4
 	end
 	f._cold = cold
 	-- Room under the last row: the measured string heights come out a few px
@@ -325,12 +332,12 @@ function P.Refresh()
 	for _ in pairs(missing) do nMissing = nMissing + 1 end
 	local ni, np = #items, nPlayers or 0
 	f.count:SetText(("%d item%s, %d raider%s"):format(ni, ni == 1 and "" or "s", np, np == 1 and "" or "s")
-		.. (nMissing > 0 and (" |cffff7070(" .. nMissing .. " not here)|r") or ""))
+		.. (nMissing > 0 and (" |cffff7070(" .. nMissing .. " away)|r") or ""))
 
 	f.child:SetHeight(math.max(1, y))
-	local h = math.min(MAX_H, math.max(MIN_H, HDR_H + 6 + y + PAD))
+	local h = math.min(MAX_H, math.max(MIN_H, HDR_H + 12 + y + PAD))
 	f:SetHeight(h)
-	local view = h - (HDR_H + 6) - PAD
+	local view = h - (HDR_H + 12) - PAD
 	local maxScroll = math.max(0, y - view)
 	f.sb:SetMinMaxValues(0, maxScroll)
 	if f.sb:GetValue() > maxScroll then f.sb:SetValue(maxScroll) end
@@ -341,7 +348,8 @@ end
 -- mini roll on screen to sit beside.
 local function allowed()
 	local rm = rollWin()
-	return isML() and (SR.Summary() ~= nil or RatRoll.LITE) and rm and rm:IsShown()
+	-- only in SR mode: a list left over from another night does not belong on a council or roll night
+	return isML() and SR.WhisperMode() and (SR.Summary() ~= nil or RatRoll.LITE) and rm and rm:IsShown()
 end
 
 function P.Show()
@@ -391,9 +399,11 @@ do
 	end
 end
 
-SLASH_OKRES1 = "/rrsr"
-SlashCmdList["OKRES"] = function()
-	if not isML() then RatRoll:Print("Soft reserves: only the master looter has this list."); return end
+SLASH_RRRES1 = "/rrsr"
+SlashCmdList["RRRES"] = function(msg)
+	-- /rrsr mode|open|lock|post|list|test -- see SoftRes-Live.lua
+	if SR.Slash and SR.Slash(msg) then return end
+	if not isML() then RatRoll:Print("Soft reserves: only the master looter, an officer or the raid leader see this list."); return end
 	if not (SR.Summary() or RatRoll.LITE) then RatRoll:Print("Soft reserves: none loaded -- paste the CSV on the Loot page."); return end
 	local rm = rollWin()
 	if not (rm and rm:IsShown()) and RatRoll.RollMgr and RatRoll.RollMgr.Toggle then RatRoll.RollMgr.Toggle() end

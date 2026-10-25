@@ -7,7 +7,11 @@
 --  Every generated file starts with `if RATROLL_OFF then return end`.
 -- ============================================================
 
-if IsAddOnLoaded("Okanvil") or Okanvil then
+-- Side by side, for testing the two against each other: Okanvil's saved
+-- variables are already loaded here, so a flag in them lets RatRoll run too.
+--   /run Okanvil_DB.ratrollSideBySide = true; ReloadUI()     (nil to undo)
+local sideBySide = Okanvil_DB and Okanvil_DB.ratrollSideBySide
+if (IsAddOnLoaded("Okanvil") or Okanvil) and not sideBySide then
 	RATROLL_OFF = true
 	local f = CreateFrame("Frame")
 	f:RegisterEvent("PLAYER_LOGIN")

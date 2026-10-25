@@ -27,13 +27,15 @@ RatRoll.RollMgr = RM
 -- Rolls expanded inline under an item pushed every other item down the moment a
 -- 25-man roll-off came in, and the place to click moved with them; a fixed box keeps
 -- the item list still and the Give button in one place.
---   LIST_ROWS -- item rows visible in the list (the list shrinks to fewer).
+--   LIST_ROWS -- item rows visible in the list; more scroll inside it.
 --   MAX_ROLLS -- rolls visible in the roll box; more scroll inside it.
 -- One size. There used to be a "full" layout twice this wide, switched by a
 -- chevron in the title bar -- but the compact one is what the window is FOR: a
 -- small thing beside the loot frame that never covers what you are looting.
-local SIZE = { ROW_H = 26, FONT_SZ = 11, SUB_SZ = 9, ROLL_H = 15, LIST_ROWS = 6, WIN_W = 270 }
-local MAX_ROLLS = 6   -- rolls visible in the roll box; the rest scroll within it
+local SIZE = { ROW_H = 32, FONT_SZ = 11, SUB_SZ = 9, ROLL_H = 17, LIST_ROWS = 4, WIN_W = 270 }
+local MAX_ROLLS = 4   -- rolls visible in the roll box; the rest scroll within it
+-- The rolls are what the raid reads off the screen mid roll-off: larger than the list.
+local ROLL_SZ, ROLL_HD_SZ = 12, 11
 local STATUS_W = 56   -- the fixed status column on an item row ("rolling", "asked")
 
 -- Live geometry, unpacked from SIZE. These are locals rather than SIZE lookups
@@ -52,7 +54,7 @@ local ROW_H, FONT_SZ, SUB_SZ, ROLL_H, LIST_ROWS, WIN_W =
 -- These MUST be declared after ROW_H: a Lua function closes over the locals visible
 -- where it is WRITTEN, so declaring them above would have captured a global (nil) ROW_H
 -- and thrown on the first row it drew.
-local PAD, ICO_GAP = 4, 7
+local PAD, ICO_GAP = 4, 9
 local function iconSize() return ROW_H - 4 end
 local function textX() return PAD + iconSize() + ICO_GAP end
 
@@ -74,7 +76,7 @@ end
 -- mode switch can never leave them disagreeing (which clipped the bottom buttons).
 -- no status line (ML / Raider): the tabs already say which mode you're in, so the
 -- body starts straight under the title bar.
-local function BODY_TOP() return 28 end
+local function BODY_TOP() return 34 end
 
 -- Icon resolver: delegates to the shared Core warmer (RatRoll:ItemIcon), which
 -- returns the icon now or nil + auto-queues a server query so a later tick fills
@@ -119,8 +121,13 @@ end
 -- with no master loot at all (solo). It stays a named function because Rebuild decides
 -- the layout from it and OnRollOpen decides whether the layout needs rebuilding from it,
 -- and those two must never disagree.
+--
+-- A called roll counts too, whatever the loot method: a raid on group loot for speed has
+-- one person carry the items and call /roll on them at the end, and the raiders need the
+-- buttons for that roll-off just as much as under master loot.
 local function wantsChatRollButtons()
 	if L and L.IsMasterLootMethod and L.IsMasterLootMethod() then return true end
+	if L and L.RollIsOpen and L.RollIsOpen() then return true end
 	return amML()
 end
 
@@ -268,12 +275,37 @@ local pendingJumpNewest = false
 local function isML() return amML() end
 RM.IsML = isML
 
+-- The one raider who soft-reserved this drop, when exactly one did: the item is
+-- theirs without a roll. Not offered when that raider is no longer in the group.
+local function soleReserver(d)
+	local SRM = RatRoll.SoftRes
+	if not (SRM and d and d.id) then return nil end
+	local list = SRM.For(d.id)
+	if #list ~= 1 then return nil end
+	local name = list[1].name
+	local inGroup = (GetNumRaidMembers() or 0) > 0 or (GetNumPartyMembers() or 0) > 0
+	if inGroup and not (UnitInRaid(name) or UnitInParty(name)) then return nil end
+	return name
+end
+
 local function buildWindow()
 	if win then return win end
 	local f = CreateFrame("Frame", "RatRoll_RollMgr", UIParent)
 	f:SetSize(WIN_W, 200)   -- height set dynamically in Refresh
 	local d = db()
-	f:SetPoint(d.point or "RIGHT", UIParent, d.point or "RIGHT", d.x or -30, d.y or 60)
+	-- Pinned by its TOP: the height changes per boss page, and a centre anchor grew the
+	-- window both ways -- the header slid and the close X landed under the page arrow.
+	if d.point == "TOPLEFT" and d.x and d.y then
+		f:SetPoint("TOPLEFT", UIParent, "BOTTOMLEFT", d.x, d.y)
+	else
+		f:SetPoint(d.point or "RIGHT", UIParent, d.point or "RIGHT", d.x or -30, d.y or 60)
+		local l, t = f:GetLeft(), f:GetTop()
+		if l and t then
+			f:ClearAllPoints()
+			f:SetPoint("TOPLEFT", UIParent, "BOTTOMLEFT", l, t)
+			d.point, d.x, d.y = "TOPLEFT", l, t
+		end
+	end
 	-- DIALOG, not HIGH. The main hub window is HIGH too, and two frames sharing a
 	-- strata have no defined order between them -- so the mini roll and the hub
 	-- interleaved, drawing the hub's rows through the roll list. This window
@@ -290,23 +322,21 @@ local function buildWindow()
 	f:SetScript("OnDragStart", f.StartMoving)
 	f:SetScript("OnDragStop", function(s)
 		s:StopMovingOrSizing()
-		local p, _, _, x, y = s:GetPoint(1)
-		d.point, d.x, d.y = p, x, y
+		local l, t = s:GetLeft(), s:GetTop()
+		if not (l and t) then return end
+		s:ClearAllPoints()
+		s:SetPoint("TOPLEFT", UIParent, "BOTTOMLEFT", l, t)
+		d.point, d.x, d.y = "TOPLEFT", l, t
 	end)
 	f:SetClampedToScreen(true)
 
-	W.ForgeArt(f, 0.22)
-	-- header: the setup's -- no raised strip, a hairline under it
-	local hdr = W.Frame(f, "bare")
-	hdr:SetPoint("TOPLEFT", 1, -1); hdr:SetPoint("TOPRIGHT", -1, -1); hdr:SetHeight(26)
-	W.Hairline(hdr, "BOTTOM", 8)
-	local ico = hdr:CreateTexture(nil, "OVERLAY")
-	ico:SetSize(16, 16); ico:SetPoint("LEFT", 8, 0)
-	ico:SetTexture(RatRoll.BRAND_ICON)   -- the addon icon, like the shell
-	ico:SetTexCoord(0.08, 0.92, 0.08, 0.92)
-	local title = W.Text(hdr, "", "body", "accent"); title:SetPoint("LEFT", ico, "RIGHT", 6, 0); title:Color(1, 0.82, 0)
+	W.ForgeArt(f, 0.22, W.LOOT_ART)
+	-- the windows' title bar; the title on the left, since the bar carries buttons
+	local hdr = W.TitleBar(f, 26)
+	local title = hdr.title
+	title:ClearAllPoints(); title:SetPoint("LEFT", 10, 0); title:SetJustifyH("LEFT")
 	f.title = title
-	local close = W.Button(hdr, "X"); close:SetSize(22, 20); close:SetPoint("RIGHT", -3, 0)
+	local close = W.CloseButton(hdr); close:SetSize(18, 18); close:SetPoint("RIGHT", -4, 0)
 	close:SetScript("OnClick", function() f:Hide() end)
 	f.closeBtn = close
 	-- Ctrl + mouse wheel on the title bar sizes the window; never past the screen
@@ -316,6 +346,12 @@ local function buildWindow()
 	local srB = W.Button(hdr, "SR"); srB:SetSize(30, 20); srB:SetPoint("RIGHT", close, "LEFT", -4, 0)
 	srB:Tooltip("Soft reserves: every reserved item, who reserved it,\nand what happened to it tonight.")
 	srB:SetScript("OnClick", function()
+		-- on a council night with the wishlist on, this is WH: the wish list
+		local SRM = RatRoll.SoftRes
+		if SRM and SRM.Mode() == "council" and RatRoll.Wish then
+			RatRoll.Wish.Panel.Toggle()
+			return
+		end
 		local P = RatRoll.SoftResPanel
 		if P then P.Toggle() end
 	end)
@@ -372,7 +408,7 @@ local function buildWindow()
 	-- Back to the council board of the open round, for an officer who closed it.
 	-- Only while a round is open (RM.SyncCouncilButton).
 	local cnB = W.Button(hdr, "Council"); cnB:SetSize(58, 20)
-	cnB:Tooltip("Open the council board of the round in progress.")
+	cnB:Tooltip("Open or close the council board of the round in progress.")
 	cnB:SetScript("OnClick", function()
 		local CC = RatRoll.Council
 		if CC and CC.OpenBoard then CC.OpenBoard() end
@@ -428,6 +464,15 @@ local function buildWindow()
 			local needRefresh = false
 			for _, r in ipairs(self.itemRows) do
 				local d = r._d
+				if r:IsShown() and r._clock then
+					local left = r._clock[2] - (GetTime() - r._clock[1])
+					if left <= 0 then r.prog:Hide(); r._clock = nil
+					else
+						r.prog:SetWidth(math.max(1, r.progSpan() * math.min(1, 1 - left / r._clock[2])))
+						-- the seconds left, where "rolling" was
+						r.status:SetText(("|cffffd200%ds|r"):format(math.ceil(left)))
+					end
+				end
 				if r:IsShown() and r._rolling and d then
 					-- SETTLED: the roll is over the moment the item has an owner (or
 					-- everyone passed). recordRollWon() clears rollID *and* rollStart, which
@@ -553,11 +598,11 @@ function RM.Rebuild()
 	-- compact). Create `nxt` first so the label can anchor to it.
 	local pgH = 18
 	local pgW = 20
-	local prev = keep(W.Button(body, "<")); prev:SetSize(pgW, pgH); prev:SetPoint("TOPLEFT", M, y)
+	local prev = keep(W.Button(body, "<", "glyph")); prev:SetSize(pgW, pgH); prev:SetPoint("TOPLEFT", M, y)
 	prev:SetScript("OnClick", function()
 		f.bossIdx = math.max(1, (f.bossIdx or 1) - 1); selected = nil; f.userCleared = false; f.itemScroll = 0; f.rollScroll = 0; RM.Refresh()
 	end)
-	local nxt = keep(W.Button(body, ">")); nxt:SetSize(pgW, pgH); nxt:SetPoint("TOPRIGHT", -M, y)
+	local nxt = keep(W.Button(body, ">", "glyph")); nxt:SetSize(pgW, pgH); nxt:SetPoint("TOPRIGHT", -M, y)
 	nxt:SetScript("OnClick", function()
 		f.bossIdx = math.min(f.bossCount or 1, (f.bossIdx or 1) + 1); selected = nil; f.userCleared = false; f.itemScroll = 0; f.rollScroll = 0; RM.Refresh()
 	end)
@@ -572,7 +617,7 @@ function RM.Rebuild()
 	-- (fitList below), so three drops give a three-row window instead of a tall empty
 	-- panel. LIST_H here is only the starting height; Refresh has the real content.
 	local LIST_H = LIST_ROWS * ROW_H
-	local ibox = keep(W.Frame(body, "soft")); ibox:SetPoint("TOPLEFT", M, y); ibox:SetSize(INNER, LIST_H + 6)
+	local ibox = keep(W.Frame(body, "bare")); ibox:SetPoint("TOPLEFT", M, y); ibox:SetSize(INNER, LIST_H + 6)
 	f.ibox = ibox
 	f.listH = LIST_H
 	-- Everything below the list is anchored under it, so shrinking the box has to move
@@ -613,38 +658,48 @@ function RM.Rebuild()
 		r.bar:SetPoint("TOPLEFT", 0, 0); r.bar:SetPoint("BOTTOMLEFT", 0, 0)
 		r.bar:SetTexture(0.75, 0.58, 0.23, 0.30)   -- gold, translucent
 		r.bar:Hide()
+		-- the roll we called: a loading bar along the row's foot, filling as its
+		-- timer runs, so the end of the roll is where the bar is full
+		r.prog = r:CreateTexture(nil, "OVERLAY")
+		r.prog:SetTexture("Interface\\Buttons\\WHITE8x8")
+		r.prog:SetVertexColor(1, 0.82, 0, 0.9)
+		-- under the text only, clear of the icon and the row's edges
+		r.progX = PAD - 1 + (ROW_H - 2) + ICO_GAP
+		r.progSpan = function() return math.max(1, r:GetWidth() - r.progX - PAD - 2) end
+		r.prog:SetHeight(2)
+		r.prog:SetPoint("BOTTOMLEFT", r.progX, 2)
+		r.prog:Hide()
 		-- TWO-LINE ROW. The icon takes the full height (so it is big enough to read at
 		-- a glance), the item NAME sits on the top line with the whole width to itself,
 		-- and the winner + trade timer share the line beneath it. Nothing has to be
 		-- truncated to make room for anything else.
-		local icoSz = ROW_H - 4
-		r.icon = r:CreateTexture(nil, "ARTWORK")
-		r.icon:SetSize(icoSz, icoSz)
-		r.icon:SetPoint("LEFT", PAD, 0)
-		r.icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+		local icoSz = ROW_H - 2
+		r.slot = W.FramedIcon(r, nil, icoSz, false)
+		r.slot:SetPoint("LEFT", PAD - 1, 0)
+		r.icon = r.slot.icon
 
 		-- line 1: item name, rarity-coloured, and a FIXED status column on the right
 		-- ("rolling", "asked"). The column is placed first and the name is cut
 		-- before it, so a long name can never hide the status.
 		r.status = W.Text(r, "", SUB_SZ)
-		r.status:SetPoint("TOPRIGHT", -PAD, -3)
+		r.status:SetPoint("TOPRIGHT", -PAD, -5)
 		r.status:SetWidth(STATUS_W)
 		r.status:SetJustifyH("RIGHT")
 		if r.status.SetWordWrap then r.status:SetWordWrap(false) end
 		r.txt = W.Text(r, "", FONT_SZ)
-		r.txt:SetPoint("TOPLEFT", r.icon, "TOPRIGHT", ICO_GAP, 1)
+		r.txt:SetPoint("TOPLEFT", r.slot, "TOPRIGHT", ICO_GAP, -3)
 		r.txt:SetPoint("RIGHT", r.status, "LEFT", -4, 0)
 		r.txt:SetJustifyH("LEFT")
 		if r.txt.SetWordWrap then r.txt:SetWordWrap(false) end
 
 		-- line 2: who won it (left) and how long it can still be traded (right)
 		r.sub = W.Text(r, "", SUB_SZ)
-		r.sub:SetPoint("BOTTOMLEFT", r.icon, "BOTTOMRIGHT", ICO_GAP, 0)
+		r.sub:SetPoint("BOTTOMLEFT", r.slot, "BOTTOMRIGHT", ICO_GAP, 4)
 		r.sub:SetJustifyH("LEFT")
 		if r.sub.SetWordWrap then r.sub:SetWordWrap(false) end
 
 		r.timer = W.Text(r, "", SUB_SZ)
-		r.timer:SetPoint("BOTTOMRIGHT", -PAD, 2)
+		r.timer:SetPoint("BOTTOMRIGHT", -PAD, 4)
 		r.timer:SetJustifyH("RIGHT")
 		r.sub:SetPoint("RIGHT", r.timer, "LEFT", -4, 0)
 		r.hl = r:CreateTexture(nil, "BORDER"); r.hl:SetAllPoints(); r.hl:SetTexture(0.75, 0.58, 0.23, 0.22); r.hl:Hide()
@@ -709,14 +764,17 @@ function RM.Rebuild()
 	-- ROLLS of the selected item, in their own box --------------------------
 	-- A caption naming the item, then up to MAX_ROLLS rolls, best first. The wheel
 	-- scrolls a longer roll-off inside the box; the item list above never moves.
-	local rollHd = keep(W.Text(body, "", 10, "dim"))
+	local split = keep(body:CreateTexture(nil, "ARTWORK"))
+	split:SetTexture("Interface\\Buttons\\WHITE8x8"); split:SetVertexColor(1, 1, 1, 0.07); split:SetHeight(1)
+	split:SetPoint("TOPLEFT", M, y + 4); split:SetPoint("RIGHT", body, "RIGHT", -M, 0)
+	local rollHd = keep(W.Text(body, "", ROLL_HD_SZ, "dim"))
 	rollHd:SetPoint("TOPLEFT", M, y); rollHd:SetPoint("RIGHT", body, "RIGHT", -M, 0)
 	rollHd:SetJustifyH("LEFT")
 	if rollHd.SetWordWrap then rollHd:SetWordWrap(false) end
 	f.rollHd = rollHd
-	y = y - 16
+	y = y - 20
 	local RBOX_H = MAX_ROLLS * ROLL_H + 6
-	local rbox = keep(W.Frame(body, "soft")); rbox:SetPoint("TOPLEFT", M, y); rbox:SetSize(INNER, RBOX_H)
+	local rbox = keep(W.Frame(body, "bare")); rbox:SetPoint("TOPLEFT", M, y); rbox:SetSize(INNER, RBOX_H)
 	local function wheelRolls(_, delta)
 		f.rollScroll = (f.rollScroll or 0) - delta
 		RM.Refresh()
@@ -730,8 +788,8 @@ function RM.Rebuild()
 		rr:SetPoint("TOPLEFT", PAD, -3 - (i - 1) * ROLL_H)
 		rr:SetPoint("RIGHT", rbox, "RIGHT", -PAD, 0)
 		rr.hl = rr:CreateTexture(nil, "BORDER"); rr.hl:SetAllPoints(); rr.hl:Hide()
-		rr.num = W.Text(rr, "", FONT_SZ); rr.num:SetPoint("RIGHT", -4, 0); rr.num:SetJustifyH("RIGHT")
-		rr.txt = W.Text(rr, "", FONT_SZ); rr.txt:SetPoint("LEFT", 4, 0)
+		rr.num = W.Text(rr, "", ROLL_SZ); rr.num:SetPoint("RIGHT", -4, 0); rr.num:SetJustifyH("RIGHT")
+		rr.txt = W.Text(rr, "", ROLL_SZ); rr.txt:SetPoint("LEFT", 4, 0)
 		rr.txt:SetPoint("RIGHT", rr.num, "LEFT", -6, 0); rr.txt:SetJustifyH("LEFT")
 		if rr.txt.SetWordWrap then rr.txt:SetWordWrap(false) end
 		-- Click a roll: give the item to that player (master looter only).
@@ -762,7 +820,9 @@ function RM.Rebuild()
 		local bh = 22
 		local gap, bw = 6, (INNER - 6) / 2
 		local CC = RatRoll.Council
+		local SRM = RatRoll.SoftRes
 		local council = CC and CC.active and CC.Enabled and CC.Enabled()
+			and not (SRM and SRM.CouncilAllowed and not SRM.CouncilAllowed())
 
 		local rollB = keep(W.Button(body, "Roll", (not council) and "primary" or nil))
 		if council then
@@ -797,17 +857,28 @@ function RM.Rebuild()
 
 		-- Give: the same place as Ask / Roll, shown instead of them once there are
 		-- rolls. Its label names who it gives to; Refresh writes it.
-		local give = keep(W.Button(body, "Give", "primary"))
+		local give = keep(W.Button(body, "Give", "primary"):SetMain(true))
 		give:SetSize(INNER, bh); give:SetPoint("TOPLEFT", M, y)
 		give:SetScript("OnClick", function()
 			if not selected then RatRoll:Print("|cffff5555Pick an item first.|r"); return end
 			local top = L.RollWinner and L.RollWinner(selected)
 			if not top then
 				local ar = L.ActiveRoll()
-				if ar and ar.best and ((not ar.id) or (not selected.id) or ar.id == selected.id) then top = ar.best end
+				if ar and ar.best and L.RollIsOn(ar, selected) then top = ar.best end
 			end
-			if not top then RatRoll:Print("|cffff5555No rolls on this item yet.|r"); return end
-			L.AwardWinner(selected.id, top.player, top.roll, top.spec or ((top.kind == "os") and "off" or nil))
+			if not top then
+				-- reserved by one raider only: theirs, no roll needed
+				local sole = soleReserver(selected)
+				if sole then L.AwardWinner(selected.id, sole, nil, nil, nil, nil, true); return end
+				RatRoll:Print("|cffff5555No rolls on this item yet.|r")
+				return
+			end
+			-- A tie on top is no decided winner: the name order only picks who is listed
+			-- first, so that give goes through the confirm instead of one click.
+			local r = L.RollsRanked and L.RollsRanked(selected) or {}
+			local tied = r[2] and r[1].kind == r[2].kind and (r[1].roll or 0) == (r[2].roll or 0)
+			L.AwardWinner(selected.id, top.player, top.roll, top.spec or ((top.kind == "os") and "off" or nil),
+				nil, nil, not tied)
 		end)
 		-- Says which give this will be before it is clicked: GiveMasterLoot only
 		-- works from an OPEN corpse.
@@ -826,14 +897,39 @@ function RM.Rebuild()
 		y = y - (bh + 6)
 
 		if council then
-			local several = keep(W.Button(body, "Ask several items..."))
+			local several = keep(W.Button(body, "Ask several items..."):SetMain(true))
 			several:SetSize(INNER, bh); several:SetPoint("TOPLEFT", M, y)
 			several:SetScript("OnClick", function()
 				if CC.OpenPicker then CC.OpenPicker() end
 			end)
 			y = y - (bh + 6)
 		end
-		y = y - 4
+	end
+	-- An officer running the council with /rrcouncil force (or solo) asks too.
+	-- Ask only: giving and calling rolls need the master looter.
+	if not ml then
+		local CC = RatRoll.Council
+		local SRM = RatRoll.SoftRes
+		-- /rrcouncil force runs it whatever mode the master looter's client says
+		if CC and CC.active and CC.MayRun and CC.MayRun() and CC.Enabled and CC.Enabled()
+			and (CC.forceRun or not (SRM and SRM.CouncilAllowed and not SRM.CouncilAllowed())) then
+			local bh = 22
+			local askB = keep(W.Button(body, "Ask council", "primary"))
+			askB:SetSize(INNER, bh); askB:SetPoint("TOPLEFT", M, y)
+			askB:SetScript("OnClick", function()
+				if not (selected and selected.item) then RatRoll:Print("Pick an item first."); return end
+				CC.Ask({ selected.item }, selected.boss or "")
+				RM.Refresh()
+			end)
+			f.askB = askB
+			y = y - (bh + 10)
+		elseif SRM and SRM.Mode() == "council" then
+			-- clicking an item only shows its rolls here; say who asks
+			local hint = keep(W.Text(body, "Click an item to see its rolls. Only the master looter asks the council.",
+				10, "dim"))
+			hint:SetPoint("TOPLEFT", M, y); hint:SetWidth(INNER); hint:SetJustifyH("LEFT")
+			y = y - ((hint:GetStringHeight() or 12) + 8)
+		end
 	end
 
 	-- Your roll: everyone, the master looter included, but ONLY while a roll is
@@ -843,9 +939,9 @@ function RM.Rebuild()
 	f.yourRoll, f.yourRollH, f.yourRollLbl = nil, 0, nil
 	if wantsChatRollButtons() then
 		local y0 = y
-		local yrl = keep(W.Text(body, "Your roll", 10, "dim")); yrl:SetPoint("TOPLEFT", M, y); y = y - 16
-		yrl:SetPoint("RIGHT", body, "RIGHT", -M, 0); yrl:SetJustifyH("LEFT")
-		if yrl.SetWordWrap then yrl:SetWordWrap(false) end
+		-- no caption: the buttons say what they are, and the row keeps its room
+		-- while no roll is open so the window never changes size
+		local yrl = keep(W.Text(body, "", 10, "dim")); yrl:SetPoint("TOPLEFT", M, y); yrl:Hide()
 		local hw = (INNER - 8) / 2
 		local bh = 22
 		local myms = keep(W.Button(body, "Roll MS (100)")); myms:SetSize(hw, bh); myms:SetPoint("TOPLEFT", M, y)
@@ -853,7 +949,7 @@ function RM.Rebuild()
 		local myos = keep(W.Button(body, "Roll OS (99)")); myos:SetSize(hw, bh); myos:SetPoint("LEFT", myms, "RIGHT", 8, 0)
 		myos:SetScript("OnClick", function() L.SelfRoll("os") end)
 		y = y - (bh + 4)
-		f.yourRoll = { yrl, myms, myos }
+		f.yourRoll = { myms, myos }
 		f.yourRollLbl = yrl
 		f.yourRollH = y0 - y
 	end
@@ -866,7 +962,7 @@ function RM.Rebuild()
 
 	-- Bottom margin = M, the same inset used on the other three sides. This is the
 	-- height with the list at its FULL cap; fitList() trims it to the real content.
-	f.tailBaseH = BODY_TOP() + (-y) + M
+	f.tailBaseH = BODY_TOP() + (-y) + M - 4
 	f.tailMargin = M
 	f:SetHeight(f.tailBaseH)
 
@@ -881,7 +977,22 @@ function RM.SyncSRButton()
 	local SRM = RatRoll.SoftRes
 	-- Lite has no Loot page to paste the CSV on, so the ML gets SR (and its Load
 	-- CSV) before any list is loaded.
-	if isML() and SRM and (SRM.Summary() or RatRoll.LITE) then win.srBtn:Show() else win.srBtn:Hide() end
+	-- SR in SR mode; WH (the wishes) on a council night with the wishlist on
+	local WP = RatRoll.Wish and RatRoll.Wish.Panel
+	-- the same people as WH: the master looter and the officers
+	local canSee = isML() or (RatRoll.Wish and RatRoll.Wish.CanSee and RatRoll.Wish.CanSee())
+	if canSee and SRM and SRM.WhisperMode() and (SRM.Summary() or RatRoll.LITE) then
+		win.srBtn.text:SetText("SR")
+		win.srBtn:Tooltip("Soft reserves: every reserved item, who reserved it,\nand what happened to it tonight.")
+		win.srBtn:Show()
+	elseif WP and SRM and SRM.Mode() == "council" and RatRoll.Wish.IsOn() and RatRoll.Wish.CanSee() then
+		win.srBtn.text:SetText("WH")
+		win.srBtn:Tooltip("Wishes: what each raider is after this raid ID.")
+		win.srBtn:Show()
+	else
+		win.srBtn:Hide()
+	end
+	if WP then WP.Sync() end
 	-- Clear sits next to SR when SR is there, else straight next to X: anchored to
 	-- a hidden SR it kept SR's empty slot as a gap.
 	if win.clrBtn then
@@ -895,16 +1006,24 @@ end
 function RM.SyncCouncilButton()
 	if not (win and win.cnBtn) then return end
 	local CC = RatRoll.Council
-	if CC and CC.HasOpenRound and CC.HasOpenRound() then win.cnBtn:Show() else win.cnBtn:Hide() end
+	-- only on a council night (yours or the master looter's) or in a test
+	local night = CC and (CC.active or CC.remoteNight or CC.testMode)
+	if night and CC.HasOpenRound and CC.HasOpenRound() then win.cnBtn:Show() else win.cnBtn:Hide() end
 	local left = (win.clrBtn and win.clrBtn:IsShown() and win.clrBtn)
 		or (win.srBtn:IsShown() and win.srBtn) or win.closeBtn
 	win.cnBtn:ClearAllPoints()
 	win.cnBtn:SetPoint("RIGHT", left, "LEFT", -4, 0)
+	-- The title ends where the buttons begin, cut short rather than under them.
+	if win.title then
+		local first = win.cnBtn:IsShown() and win.cnBtn or left
+		win.title:SetPoint("RIGHT", first, "LEFT", -6, 0)
+		win.title:SetJustifyH("LEFT")
+		if win.title.SetWordWrap then win.title:SetWordWrap(false) end
+	end
 end
 
--- Shrink the list (and the window) to what is actually in it. The list is laid out
--- against LIST_ROWS -- the CAP -- so three drops would otherwise leave a tall empty
--- panel and a window mostly full of nothing.
+-- The list keeps its full LIST_ROWS height whatever is in it: the window is one
+-- fixed size, and more drops than fit scroll inside the list.
 --
 -- `usedH` is the real height of the rendered rows. Everything below the list slides up
 -- by the difference, and the window loses the same amount.
@@ -916,7 +1035,7 @@ end
 local function fitList(f, usedH)
 	if not (f.ibox and f.tail and f.tailBaseH) then return end
 	local full = f.listAssumedH or (LIST_ROWS * ROW_H + 6)
-	local want = math.min(full, math.max(ROW_H, usedH + 6))
+	local want = full
 	local shrink = full - want
 	f.ibox:SetHeight(want)
 	f.listH = want - 6
@@ -963,7 +1082,7 @@ function RM.SelectItemById(id, exact)
 	-- different copy from the one taking the rolls: you watched "no rolls yet" while
 	-- the rolls landed on its twin.
 	--
-	-- Without it, two passes: first an item still OPEN for rolls (not awarded), so
+	-- Without it: a copy not rolled yet; then an item still OPEN for rolls (not awarded), so
 	-- re-rolling a fresh drop of an id doesn't land on an old awarded copy; then any copy.
 	local groups = L.DropsByBoss and L.DropsByBoss() or {}
 	local function pick(mode)
@@ -971,6 +1090,8 @@ function RM.SelectItemById(id, exact)
 			for ii, d in ipairs(g.items) do
 				local hit
 				if mode == "exact" then hit = (d == exact)
+				elseif mode == "fresh" then
+					hit = d.id == id and not d.receivedBy and not d.rollDone and not (d.rolls and #d.rolls > 0)
 				else hit = d.id == id and (mode ~= "open" or not d.receivedBy) end
 				if hit then
 					selected = d                    -- module-scope: survives the window not existing
@@ -1001,6 +1122,9 @@ function RM.SelectItemById(id, exact)
 		return false
 	end
 	if exact and pick("exact") then return end
+	-- a copy nobody has rolled yet before one whose roll-off already ran (a Trophy
+	-- won on boss 1 still sits in the ML's bags, unawarded, until it is traded)
+	if pick("fresh") then return end
 	if pick("open") then return end
 	pick("any")
 end
@@ -1008,19 +1132,20 @@ end
 -- The rolls of one item, ranked. ONE roll per player (the Loot module already keeps
 -- only the first, this guards the manual-roll list too, which has no such rule).
 --
--- Rank: need beats all; ms (a /roll 1-100) beats os (a /roll 1-99); greed and
--- disenchant tie at the base level (the game awards the higher number between them,
--- so a greed 14 does NOT beat a DE 35). Equal ranks go to the higher number, and
--- equal numbers break on name -- table.sort is not stable, so without that tiebreak
--- two people on the same roll would swap places on every repaint.
-local RANK = { need = 3, ms = 2, greed = 1, de = 1, os = 0 }
+-- Rank: the same two tiers L.RollWinner uses, so the list and the item row always
+-- name the same winner. Need and ms (a /roll 1-100) are the top tier; greed,
+-- disenchant and os (a /roll 1-99) the lower one (the game awards the higher number
+-- between greed and DE, so a greed 14 does NOT beat a DE 35). Equal ranks go to the
+-- higher number, and equal numbers break on name -- table.sort is not stable, so
+-- without that tiebreak two people on the same roll would swap places on every repaint.
+local RANK = { need = 2, ms = 2, greed = 1, de = 1, os = 1 }
 
 local function rankedRolls(dp, ar)
 	local out, seen = {}, {}
 	local src
 	if dp and dp.rolls and #dp.rolls > 0 then
 		src = dp.rolls
-	elseif dp and ar and ((not ar.id) or (not dp.id) or (ar.id == dp.id)) then
+	elseif L.RollIsOn(ar, dp) then
 		src = ar.list          -- a managed /roll running on this item
 	end
 	for _, e in ipairs(src or {}) do
@@ -1207,8 +1332,10 @@ function RM.Refresh()
 				-- more than "X receives loot" -- the award confirm is the ML's alone -- so
 				-- hiding the holder left every handed-out item looking unclaimed.
 				local holder = (not d.awarded) and d.heldBy ~= nil and d.heldBy ~= "" and d.heldBy or nil
-				local heldByML = not d.awarded and ((holder ~= nil and holder == mlName)
-					or (mlName ~= nil and d.receivedBy == mlName))
+				-- the ML, or anyone handing loot out (a pug leader holding the bags)
+				local isHolder = L.IsHolder or function() return false end
+				local heldByML = not d.awarded and ((holder ~= nil and (holder == mlName or isHolder(holder)))
+					or (mlName ~= nil and d.receivedBy == mlName) or isHolder(d.receivedBy))
 
 				-- "passed" only ever means NOBODY has it, so a known owner outranks it:
 				-- an item everyone passed on can still be handed out by the master
@@ -1231,14 +1358,14 @@ function RM.Refresh()
 				elseif d.passed then
 					sub = "|cff8a8d93passed|r"
 				else
-					-- Unrolled, or simply sitting with the ML. A reserved item says who
-					-- it is reserved for, so the call can be made without looking it up.
+					-- Unrolled, or simply sitting with the ML. A reserved item's names are
+					-- on its tooltip and in the SR list; the line stays for the winner.
 					local SRM = RatRoll.SoftRes
 					local why = SRM and SRM.Blocked and SRM.Blocked(d.item ~= "" and d.item or d.id, d.boe)
 					if why then
 						sub = "|cff8a8d93" .. why .. ", no roll|r"
 					elseif SRM and SRM.IsReserved(d.id) then
-						sub = SRM.Names(d.id, false, 3)   -- the whole list is on the tooltip
+						sub = ""
 					else
 						sub = ""
 					end
@@ -1253,6 +1380,7 @@ function RM.Refresh()
 				r.timer:SetText(left and ("|cffc0943a" .. left .. "|r") or "")
 
 				r.hl:SetShown(selected == d)
+				W.SetFramedIconGold(r.slot, selected == d)
 				-- roll timer bar: show while a roll is live for this item and not yet won.
 				-- Live = a native need/greed roll (d.rollID) OR the time-based fallback
 				-- (d.rollStart). Master loot has neither, so no bar. The window's OnUpdate
@@ -1274,6 +1402,19 @@ function RM.Refresh()
 						elseif CC and CC.IsAsked and CC.IsAsked(d.id) then st = "|cff8a8d93asked|r" end
 					end
 					r.status:SetText(st)
+					-- the roll we called runs on our own clock: the same shrinking bar
+					-- the clock is on the item (set when the roll is called)
+					local copen, csecs = d.callAt, tonumber(d.callSecs) or 0
+					if not owned and rollTarget == d and copen and csecs > 0
+						and GetTime() - copen < csecs then
+						r._clock = { copen, csecs }
+						local frac = (GetTime() - copen) / csecs
+						r.prog:SetWidth(math.max(1, r.progSpan() * math.max(0, math.min(1, frac))))
+						r.prog:Show()
+					else
+						r._clock = nil
+						r.prog:Hide()
+					end
 				end
 				r.txt:SetText(baseTxt)
 				r:Show()
@@ -1326,12 +1467,12 @@ function RM.Refresh()
 				-- the roll TYPE: `kind` is the captured roll (need/greed/de, or ms/os
 				-- from the 1-100 vs 1-99 range); `spec` is the managed roll's own field
 				local kind = e.kind or ((e.spec == "off") and "os" or "ms")
-				local tag = ({ need = "|cff7cfc8aNeed|r", greed = "|cff8a8d93Greed|r",
+				local tag = ({ need = "|cffffd200Need|r", greed = "|cff8a8d93Greed|r",
 					de = "|cff8a5ad9DE|r", os = "|cff8a5ad9OS|r", ms = "|cff8a8d93MS|r" })[kind] or ""
 				local isBest = (e == best)
-				rr.txt:SetText((isBest and "|cff7cfc8a> |r" or "") .. classColorCode(e.player) .. e.player .. "|r")
+				rr.txt:SetText((isBest and "|cffffd200> |r" or "") .. classColorCode(e.player) .. e.player .. "|r")
 				rr.num:SetText(tag .. "  |cffffd200" .. (e.roll or 0) .. "|r")
-				if isBest then rr.hl:SetTexture(0.49, 0.99, 0.54, 0.16); rr.hl:Show() else rr.hl:Hide() end
+				if isBest then rr.hl:SetTexture(1, 0.82, 0, 0.12); rr.hl:Show() else rr.hl:Hide() end
 				rr:Show()
 			elseif i == 1 then
 				rr.txt:SetText(selected and "|cff5e6166no rolls yet|r" or "")
@@ -1351,32 +1492,44 @@ function RM.Refresh()
 		local owned = selected and selected.receivedBy and selected.receivedBy ~= ""
 			and selected.receivedBy ~= mlName
 		local top = selected and L.RollWinner and L.RollWinner(selected)
-		if not top and selected and ar and ar.best and ((not ar.id) or ar.id == selected.id) then top = ar.best end
+		if not top and selected and ar and ar.best and L.RollIsOn(ar, selected) then top = ar.best end
+		local sole = selected and not top and not owned and soleReserver(selected)
 		if selected and top and not owned then
 			local tag = (top.kind == "os" or top.spec == "off") and " OS" or ""
 			f.giveB.text:SetText("Give to " .. top.player .. " (" .. (top.roll or 0) .. tag .. ")")
 			f.giveB:Show()
 			if f.askB then f.askB:Hide() end
 			if f.rollB then f.rollB:Hide() end
+		elseif sole then
+			f.giveB.text:SetText("Give to " .. sole .. " (SR)")
+			f.giveB:Show()
+			if f.askB then f.askB:Hide() end
+			if f.rollB then f.rollB:Hide() end
 		else
 			f.giveB:Hide()
 			if f.askB then f.askB:Show() end
-			if f.rollB then f.rollB:Show() end
+			if f.rollB then
+				-- a contested reserve: Main spec rolls among the reservers only
+				local SRM = RatRoll.SoftRes
+				local n = (selected and SRM and #SRM.For(selected.id)) or 0
+				f.rollB.text:SetText(n >= 2 and ("Roll SR (" .. n .. ")") or "Roll")
+				f.rollB:Show()
+			end
 		end
 	end
 
-	-- YOUR ROLL: only while a roll is open, and the window shrinks when it is not.
+	-- YOUR ROLL: only while a roll is open, and its room only then: the row is last
+	-- in the window, so the window just loses that much at the bottom.
 	if f.yourRoll then
 		local open = L.RollIsOpen and L.RollIsOpen()
 		for _, w in ipairs(f.yourRoll) do
 			if open then w:Show() else w:Hide() end
 		end
+		if f.tailBaseH then f:SetHeight(f.tailBaseH - (open and 0 or (f.yourRollH or 0))) end
 		if open then
 			local t = L.RollTargetDrop and L.RollTargetDrop()
 			f.yourRollLbl:SetText("Your roll" .. ((t and t.name and t.name ~= "")
 				and ("  |cff8a8d93" .. t.name .. "|r") or ""))
-		else
-			f:SetHeight(f:GetHeight() - (f.yourRollH or 0))
 		end
 	end
 
@@ -1422,6 +1575,11 @@ local function showWin()
 		pendingJumpNewest = false
 	elseif pendingJumpNewest then
 		win._jumpNewest = true; pendingJumpNewest = false
+	end
+	-- who opened it: the window popping up on its own is otherwise untraceable
+	if not win:IsShown() and debugstack then
+		local where = (debugstack(2, 3, 0) or ""):gsub("Interface\\AddOns\\RatRoll\\", ""):gsub("\n", " < ")
+		RatRoll:Trace("ROLL", "mini roll opened: " .. where:sub(1, 240))
 	end
 	win:Show()                       -- always show (idempotent)
 	win:Raise()                      -- bring to front in case something covers it
@@ -1488,7 +1646,7 @@ local function popOrRefresh(force)
 		if dbg then L.Dbg("  => refresh (already shown)") end
 	elseif (force and db().autoShow) or canAutoShow() then
 		pendingJumpNewest = true; showWin()        -- eligible (or forced) -> build, show, then jump
-		if dbg then L.Dbg("  => |cff7cfc8aSHOW|r") end
+		if dbg then L.Dbg("  => |cffffd200SHOW|r") end
 	else
 		pendingJumpNewest = true                    -- hidden + not eligible -> remember for next open
 		if dbg then L.Dbg("  => |cffff5555NOT shown|r (not eligible)") end
@@ -1506,6 +1664,13 @@ local function onLoot() popOrRefresh(false) end
 local lastChatRoll = nil
 function RM.OnRollOpen()
 	popOrRefresh(false)
+	RM.SyncRollButtons()
+end
+
+-- Re-decide the "Your roll" pair without repainting the page: a call has just paged
+-- the window to the called item (pendingBossIdx), and a popOrRefresh here would
+-- consume that and let the call's forced pop jump to the newest boss instead.
+function RM.SyncRollButtons()
 	if not (win and win:IsShown()) then return end
 	local now = wantsChatRollButtons()
 	if now == lastChatRoll then return end
@@ -1592,7 +1757,7 @@ local function mlChanged()
 	if not mlFlipped then return end     -- method-only change: no need to announce
 	local who = L.MasterLooterName and L.MasterLooterName()
 	if now then
-		RatRoll:Print("You are now the |cff7cfc8aMaster Looter|r.")
+		RatRoll:Print("You are now the |cffffd200Master Looter|r.")
 	elseif who then
 		RatRoll:Print("Master Looter is now |cffffd200" .. who .. "|r.")
 	end
@@ -1632,6 +1797,9 @@ ev:SetScript("OnEvent", function(_, event)
 		if not lootOn() then return end
 		local ok, err = pcall(RM.SelectItemById, id, dp)
 		if not ok and RatRoll.Err then RatRoll:Err("RollMgr SelectItemById", err) end
+		-- a call under group loot is what brings the roll buttons, so re-decide them now
+		-- rather than on the first roll that lands
+		RM.SyncRollButtons()
 	end
 	-- fired the instant a loot window opens with items (RaidRoll / RCLootCouncil
 	-- model) -- pop the mini roll even if the item is filtered from recording, and
@@ -1643,8 +1811,8 @@ ev:SetScript("OnEvent", function(_, event)
 	end
 end)
 
-SLASH_OKROLL1 = "/rr"
-SlashCmdList["OKROLL"] = function(msg)
+SLASH_RRROLL1 = "/rr"
+SlashCmdList["RRROLL"] = function(msg)
 	if not lootOn() then
 		RatRoll:Print("|cff8a8d93The Loot module is switched off.|r")
 		return
