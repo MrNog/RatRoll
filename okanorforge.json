@@ -1,0 +1,9 @@
+{
+  "game": "wotlk",
+  "name": "RatRoll",
+  "desc": "Rolls, ML & soft reserve",
+  "folders": [
+    "RatRoll"
+  ],
+  "asset": "RatRoll.zip"
+}
